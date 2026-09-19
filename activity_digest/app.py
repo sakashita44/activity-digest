@@ -175,8 +175,10 @@ def publish_wordpress_draft(
     client: httpx.Client | None = None,
 ) -> dict[str, Any]:
     base = wp_url.rstrip("/")
-    if not base.endswith("/wp/v2"):
-        base = f"{base}/v2" if "/wp-json" in base else f"{base}/wp-json/wp/v2"
+    if base.endswith("/wp-json"):
+        base = f"{base}/wp/v2"
+    elif not base.endswith("/wp/v2"):
+        base = f"{base}/wp-json/wp/v2"
     http_client = client or httpx.Client(timeout=20.0)
     try:
         response = http_client.get(
@@ -185,6 +187,11 @@ def publish_wordpress_draft(
         response.raise_for_status()
         result: Any = response.json()
         posts = cast(list[dict[str, Any]], result) if isinstance(result, list) else []
+        # 人が公開・予約した記事を下書きへ戻して編集内容を失わないよう、上書きせず止める
+        if posts and posts[0].get("status") != "draft":
+            raise RuntimeError(
+                f"slug {slug} の投稿は既に {posts[0].get('status')} 状態のため更新しない"
+            )
         payload = {
             key: value
             for key, value in (post_defaults or {}).items()

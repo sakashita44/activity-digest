@@ -361,6 +361,28 @@ class TestDigestPipeline(unittest.TestCase):
         self.assertEqual(created[0]["categories"], [3])
         self.assertNotIn("unknown", created[0])
 
+    def test_wordpress_refuses_to_overwrite_published_post(self) -> None:
+        posted: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                return httpx.Response(200, json=[{"id": 7, "status": "publish"}])
+            posted.append(request)
+            return httpx.Response(200, json={"id": 7})
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with self.assertRaises(RuntimeError):
+            publish_wordpress_draft(
+                "https://example.com/wp-json/",
+                "u",
+                "p",
+                "slug-published",
+                "T",
+                "C",
+                client=client,
+            )
+        self.assertEqual(posted, [])
+
     def test_prompt_model_and_disclosure_configuration(self) -> None:
         rendered = render_prompt("{{week}} {{events}}", {"week": "W", "events": "[]"})
         self.assertEqual(rendered, "W []")
