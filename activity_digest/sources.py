@@ -240,6 +240,12 @@ def _fetch_github_events(
             and datetime.fromisoformat(str(oldest).replace("Z", "+00:00")) < start_dt
         ):
             break
+    else:
+        logger.warning(
+            "GitHub の取得上限 %d 件に達しても期間の開始まで遡れなかった。"
+            "それより古い対象期間のイベントは収集できていない",
+            GITHUB_EVENTS_PER_PAGE * GITHUB_EVENTS_MAX_PAGES,
+        )
     return items
 
 
@@ -370,20 +376,20 @@ def load_local_events(
             )
             for idx, item in enumerate(items):
                 ts = item.get("timestamp")
-                normalized: dict[str, Any] = {}
-                if ts:
-                    moment = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-                    # オフセットなしの時刻は実行環境 (Actions では UTC) ではなく設定のタイムゾーンで解釈する
-                    if moment.tzinfo is None:
-                        moment = moment.replace(tzinfo=zone)
-                    moment = moment.astimezone(zone)
-                    if not (start_dt <= moment <= end_dt):
-                        continue
-                    normalized["timestamp"] = moment.isoformat(timespec="seconds")
+                # 期間を判定できない項目は、取り込むと毎回の記事に混入するため除外する
+                if not ts:
+                    continue
+                moment = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                # オフセットなしの時刻は実行環境 (Actions では UTC) ではなく設定のタイムゾーンで解釈する
+                if moment.tzinfo is None:
+                    moment = moment.replace(tzinfo=zone)
+                moment = moment.astimezone(zone)
+                if not (start_dt <= moment <= end_dt):
+                    continue
                 events.append(
                     {
                         **item,
-                        **normalized,
+                        "timestamp": moment.isoformat(timespec="seconds"),
                         "id": item.get("id") or f"local-{idx}",
                         "source": item.get("source", "local"),
                         "category": item.get("category", "activity"),

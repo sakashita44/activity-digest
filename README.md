@@ -60,6 +60,8 @@ CLIでは次の順に設定を上書きする。
 
 `--from` と `--to` は必ず同時に指定する。
 
+ローカルJSONのイベントは `timestamp` で期間を判定し、`timestamp` のない項目は収集しない。GitHubのイベントAPIは直近300件までしか返さないため、対象期間に300件を超える活動があると期間の前半のイベントを収集できない。この場合は警告ログを出す。
+
 ```bash
 uv run python digest.py
 uv run python digest.py --target-week 2026-W36
