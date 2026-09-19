@@ -30,6 +30,9 @@ EVENT_FIELDS = (
     "url",
     "location_label",
 )
+GITHUB_EVENTS_PER_PAGE = 100
+# GitHub の events API は直近300件までしか返さず、それ以降のページは 422 になる
+GITHUB_EVENTS_MAX_PAGES = 3
 logger = logging.getLogger("activity-digest")
 
 
@@ -100,21 +103,49 @@ def sanitize_and_order_events(
             except (ValueError, TypeError):
                 pass
             item["location_label"] = label
-        for k in COORD_KEYS:
-            item.pop(k, None)
-        for k, v in list(item.items()):
-            if isinstance(v, str) and COORD_REGEX.search(v):
-                item[k] = COORD_REGEX.sub("[座標マスク]", v)
-        sanitized.append({k: v for k, v in item.items() if k in EVENT_FIELDS})
-    sanitized.sort(key=lambda x: (x.get("timestamp", ""), x.get("id", "")))
+        kept: dict[str, Any] = {}
+        for k, v in item.items():
+            if k not in EVENT_FIELDS or v is None:
+                continue
+            # 数値や入れ子の値に含まれる座標もマスクできるよう、文字列化してから検査する
+            text = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+            kept[k] = COORD_REGEX.sub("[座標マスク]", text)
+        sanitized.append(kept)
+    sanitized.sort(key=_event_sort_key)
     return sanitized
+
+
+def _event_sort_key(event: dict[str, Any]) -> tuple[bool, datetime, str]:
+    # 出典ごとに UTC オフセットが異なり得るため、文字列ではなく時刻として比較する
+    try:
+        moment = datetime.fromisoformat(str(event["timestamp"]))
+    except (KeyError, ValueError):
+        return (True, datetime.min.replace(tzinfo=UTC), str(event.get("id", "")))
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return (False, moment, str(event.get("id", "")))
+
+
+def _contains_coordinates(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(COORD_REGEX.search(value))
+    if isinstance(value, dict):
+        mapping = cast(dict[Any, Any], value)
+        return any(k in COORD_KEYS for k in mapping) or any(
+            _contains_coordinates(v) for v in mapping.values()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_coordinates(v) for v in cast(list[Any], value))
+    if isinstance(value, float):
+        return bool(COORD_REGEX.search(repr(value)))
+    return False
 
 
 def ensure_no_coordinates(events: list[dict[str, Any]]) -> None:
     for ev in events:
         if any(k in ev for k in COORD_KEYS):
             raise ValueError("Raw coordinate key detected")
-        if any(isinstance(v, str) and COORD_REGEX.search(v) for v in ev.values()):
+        if any(_contains_coordinates(v) for v in ev.values()):
             raise ValueError("Raw coordinate pattern detected in text")
 
 
@@ -143,18 +174,7 @@ def collect_github_events(
     c = client or httpx.Client(timeout=15.0)
     events: list[dict[str, Any]] = []
     try:
-        resp = c.get(
-            f"https://api.github.com/users/{username}/events?per_page=100",
-            headers=headers,
-        )
-        resp.raise_for_status()
-        raw_payload: Any = resp.json()
-        payload = (
-            cast(list[dict[str, Any]], raw_payload)
-            if isinstance(raw_payload, list)
-            else []
-        )
-        for item in payload:
+        for item in _fetch_github_events(c, str(username), headers, start_dt):
             if not item.get("created_at"):
                 continue
             dt = datetime.fromisoformat(
@@ -179,7 +199,7 @@ def collect_github_events(
                 {
                     "id": f"gh-{item.get('id', len(events))}",
                     "source": "github",
-                    "timestamp": dt.isoformat(),
+                    "timestamp": dt.isoformat(timespec="seconds"),
                     "category": "development",
                     "title": f"{etype}: {repo}",
                     "details": f"{etype} {action}".strip(),
@@ -190,6 +210,80 @@ def collect_github_events(
         if client is None:
             c.close()
     return events
+
+
+def _fetch_github_events(
+    client: httpx.Client,
+    username: str,
+    headers: dict[str, str],
+    start_dt: datetime,
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for page in range(1, GITHUB_EVENTS_MAX_PAGES + 1):
+        resp = client.get(
+            f"https://api.github.com/users/{username}/events",
+            params={"per_page": GITHUB_EVENTS_PER_PAGE, "page": page},
+            headers=headers,
+        )
+        resp.raise_for_status()
+        raw_payload: Any = resp.json()
+        page_items = (
+            cast(list[dict[str, Any]], raw_payload)
+            if isinstance(raw_payload, list)
+            else []
+        )
+        items.extend(page_items)
+        # イベントは新しい順に返るため、期間開始より古い時刻に届いたら以降のページは不要
+        oldest = page_items[-1].get("created_at") if page_items else None
+        if len(page_items) < GITHUB_EVENTS_PER_PAGE or (
+            oldest
+            and datetime.fromisoformat(str(oldest).replace("Z", "+00:00")) < start_dt
+        ):
+            break
+    return items
+
+
+def _query_notion_data_source(
+    client: httpx.Client,
+    ds_id: str,
+    headers: dict[str, str],
+    start_dt: datetime,
+    end_dt: datetime,
+) -> list[dict[str, Any]]:
+    body: dict[str, Any] = {
+        "filter": {
+            "and": [
+                {
+                    "timestamp": "created_time",
+                    "created_time": {"on_or_after": start_dt.isoformat()},
+                },
+                {
+                    "timestamp": "created_time",
+                    "created_time": {"on_or_before": end_dt.isoformat()},
+                },
+            ]
+        },
+        "page_size": 100,
+    }
+    results: list[dict[str, Any]] = []
+    while True:
+        resp = client.post(
+            f"https://api.notion.com/v1/data_sources/{ds_id}/query",
+            headers=headers,
+            json=body,
+        )
+        resp.raise_for_status()
+        raw_payload: Any = resp.json()
+        payload = (
+            cast(dict[str, Any], raw_payload) if isinstance(raw_payload, dict) else {}
+        )
+        results_value = payload.get("results", [])
+        if isinstance(results_value, list):
+            results.extend(cast(list[dict[str, Any]], results_value))
+        next_cursor = payload.get("next_cursor")
+        if not payload.get("has_more") or not next_cursor:
+            return results
+        body["start_cursor"] = next_cursor
 
 
 def collect_notion_events(
@@ -217,25 +311,7 @@ def collect_notion_events(
     events: list[dict[str, Any]] = []
     try:
         for ds_id in target_ids:
-            resp = c.post(
-                f"https://api.notion.com/v1/data_sources/{ds_id}/query",
-                headers=headers,
-                json={},
-            )
-            resp.raise_for_status()
-            raw_payload: Any = resp.json()
-            payload = (
-                cast(dict[str, Any], raw_payload)
-                if isinstance(raw_payload, dict)
-                else {}
-            )
-            results_value = payload.get("results", [])
-            results = (
-                cast(list[dict[str, Any]], results_value)
-                if isinstance(results_value, list)
-                else []
-            )
-            for item in results:
+            for item in _query_notion_data_source(c, ds_id, headers, start_dt, end_dt):
                 ts = item.get("created_time") or item.get("last_edited_time")
                 if not ts:
                     continue
@@ -243,7 +319,8 @@ def collect_notion_events(
                 if not (start_dt <= dt <= end_dt):
                     continue
                 title = "Notion item"
-                url: Any = item.get("url")
+                # ページ自体の url は常に存在する非公開の notion.so URL のため使わない
+                url: Any = None
                 properties_value = item.get("properties", {})
                 properties = (
                     cast(dict[str, dict[str, Any]], properties_value)
@@ -262,7 +339,7 @@ def collect_notion_events(
                     {
                         "id": f"notion-{item.get('id', '')}",
                         "source": "notion",
-                        "timestamp": dt.isoformat(),
+                        "timestamp": dt.isoformat(timespec="seconds"),
                         "category": "reading" if url else "note",
                         "title": title,
                         "details": "",
@@ -293,17 +370,20 @@ def load_local_events(
             )
             for idx, item in enumerate(items):
                 ts = item.get("timestamp")
-                if ts and not (
-                    start_dt
-                    <= datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(
-                        zone
-                    )
-                    <= end_dt
-                ):
-                    continue
+                normalized: dict[str, Any] = {}
+                if ts:
+                    moment = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                    # オフセットなしの時刻は実行環境 (Actions では UTC) ではなく設定のタイムゾーンで解釈する
+                    if moment.tzinfo is None:
+                        moment = moment.replace(tzinfo=zone)
+                    moment = moment.astimezone(zone)
+                    if not (start_dt <= moment <= end_dt):
+                        continue
+                    normalized["timestamp"] = moment.isoformat(timespec="seconds")
                 events.append(
                     {
                         **item,
+                        **normalized,
                         "id": item.get("id") or f"local-{idx}",
                         "source": item.get("source", "local"),
                         "category": item.get("category", "activity"),

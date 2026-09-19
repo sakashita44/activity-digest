@@ -219,6 +219,22 @@ class TestDigestPipeline(unittest.TestCase):
         )
         ensure_no_coordinates(sanitized)
 
+    def test_coordinates_in_non_string_values_are_redacted(self) -> None:
+        raw_events = [
+            {
+                "id": "loc-3",
+                "timestamp": "2026-09-02T12:00:00+09:00",
+                "title": ["散歩", 35.681234],
+                "details": {"lat": 35.681234, "lon": 139.767123},
+            }
+        ]
+        sanitized = sanitize_and_order_events(raw_events, self.config)
+        self.assertNotIn("35.681234", json.dumps(sanitized))
+        self.assertNotIn("139.767123", json.dumps(sanitized))
+        ensure_no_coordinates(sanitized)
+        with self.assertRaises(ValueError):
+            ensure_no_coordinates([{"id": "x", "details": {"note": 35.681234}}])
+
     def test_event_id_boundaries(self) -> None:
         client = MagicMock()
         response = MagicMock()
