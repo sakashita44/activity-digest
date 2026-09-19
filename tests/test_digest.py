@@ -234,6 +234,8 @@ class TestDigestPipeline(unittest.TestCase):
         ensure_no_coordinates(sanitized)
         with self.assertRaises(ValueError):
             ensure_no_coordinates([{"id": "x", "details": {"note": 35.681234}}])
+        with self.assertRaises(ValueError):
+            ensure_no_coordinates([{"id": "y", "details": "35.681, 139.767 付近"}])
 
     def test_event_id_boundaries(self) -> None:
         client = MagicMock()

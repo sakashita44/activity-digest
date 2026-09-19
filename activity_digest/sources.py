@@ -10,7 +10,11 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-COORD_REGEX = re.compile(r"-?\b\d{1,3}\.\d{4,}\b")
+# 単独の小数は誤検出を避けて4桁以上に限り、緯度経度の組は約1km精度の2桁から検出する
+COORD_REGEX = re.compile(
+    r"-?\b\d{1,2}\.\d{2,}(?:\s*[,、/]\s*|\s+)-?\d{1,3}\.\d{2,}\b"
+    r"|-?\b\d{1,3}\.\d{4,}\b"
+)
 COORD_KEYS = (
     "location",
     "lat",
