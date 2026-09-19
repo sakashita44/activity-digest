@@ -149,8 +149,15 @@ def resolve_model(config: dict[str, Any], stage_key: str | None = None) -> str:
 def format_article_markdown(
     draft: dict[str, Any], disclosure: str = FIXED_DISCLOSURE
 ) -> str:
+    return f"# {draft.get('title', '')}\n\n" + format_article_body(draft, disclosure)
+
+
+def format_article_body(
+    draft: dict[str, Any], disclosure: str = FIXED_DISCLOSURE
+) -> str:
+    # WordPress はタイトルを別フィールドで表示するため、本文にはタイトル見出しを含めない
     required_disclosure = disclosure.strip() or FIXED_DISCLOSURE
-    lines = [f"# {draft.get('title', '')}", "", str(draft.get("summary", "")), ""]
+    lines = [str(draft.get("summary", "")), ""]
     for section in draft.get("sections", []):
         lines.extend(
             [
@@ -283,9 +290,8 @@ def run_pipeline(
         draft,
         prompt_path=prompt_config.get("editor", "prompts/editor.md"),
     )
-    final_markdown = format_article_markdown(
-        final_draft, str(config.get("disclosure", FIXED_DISCLOSURE))
-    )
+    disclosure = str(config.get("disclosure", FIXED_DISCLOSURE))
+    final_markdown = format_article_markdown(final_draft, disclosure)
 
     output_path = Path(
         output_override
@@ -306,7 +312,7 @@ def run_pipeline(
             wp_password,
             weekly_slug,
             str(final_draft.get("title", "")),
-            final_markdown,
+            format_article_body(final_draft, disclosure),
             wordpress_config.get("post_defaults", {}),
             client=http_client,
         )
