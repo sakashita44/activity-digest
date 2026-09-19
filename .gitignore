@@ -1,9 +1,16 @@
 ﻿.env
 .env.*
 !.env.example
+config.toml
+artifacts/
 __pycache__/
 *.py[cod]
 .venv/
+.uv-cache/
+.pre-commit-cache*/
+.uv-tools/
+.pytest_cache/
+.mypy_cache/
 node_modules/
 dist/
 .DS_Store

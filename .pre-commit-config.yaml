@@ -1,0 +1,57 @@
+default_stages: [pre-commit]
+
+repos:
+    - repo: https://github.com/gitleaks/gitleaks
+      rev: v8.30.1
+      hooks:
+          - id: gitleaks
+
+    - repo: https://github.com/pre-commit/mirrors-prettier
+      rev: v4.0.0-alpha.8
+      hooks:
+          - id: prettier
+            types_or: [markdown, json, yaml]
+            additional_dependencies: ['prettier@3.9.6']
+            args: [--write]
+
+    - repo: https://github.com/DavidAnson/markdownlint-cli2
+      rev: v0.23.2
+      hooks:
+          - id: markdownlint-cli2
+
+    - repo: https://github.com/pre-commit/pre-commit-hooks
+      rev: v6.0.0
+      hooks:
+          - id: trailing-whitespace
+            args: [--markdown-linebreak-ext=md]
+          - id: end-of-file-fixer
+          - id: mixed-line-ending
+            args: [--fix=no]
+          - id: check-merge-conflict
+          - id: check-yaml
+          - id: check-added-large-files
+
+    - repo: https://github.com/astral-sh/ruff-pre-commit
+      rev: v0.16.5
+      hooks:
+          - id: ruff-check
+            args: [--fix]
+          - id: ruff-format
+
+    - repo: local
+      hooks:
+          - id: pyright
+            name: pyright (型検査)
+            entry: uv run pyright
+            language: system
+            always_run: true
+            pass_filenames: false
+            stages: [pre-push]
+
+          - id: pytest
+            name: pytest
+            entry: uv run pytest
+            language: system
+            always_run: true
+            pass_filenames: false
+            stages: [pre-push]

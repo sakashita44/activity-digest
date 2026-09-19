@@ -1,0 +1,74 @@
+name: Weekly Activity Digest
+
+on:
+    schedule:
+        - cron: '0 0 * * 1'
+    workflow_dispatch:
+        inputs:
+            target_week:
+                description: '対象週（例: 2026-W36、last、current。空欄はTOML設定）'
+                required: false
+                default: ''
+            publish:
+                description: 'WordPressへ下書き登録する'
+                type: boolean
+                default: false
+
+concurrency:
+    group: digest-pipeline
+    cancel-in-progress: false
+
+jobs:
+    digest:
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+
+        steps:
+            - name: リポジトリのチェックアウト
+              uses: actions/checkout@v4
+
+            - name: uvのセットアップ
+              uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+              with:
+                  enable-cache: true
+
+            - name: Python環境の同期
+              run: uv sync --locked --dev
+
+            - name: 単体テスト実行
+              run: uv run pytest
+
+            - name: 設定ファイルの作成
+              env:
+                  DIGEST_CONFIG_TOML: ${{ secrets.DIGEST_CONFIG_TOML }}
+              run: |
+                  test -n "$DIGEST_CONFIG_TOML"
+                  printf '%s' "$DIGEST_CONFIG_TOML" > config.toml
+
+            - name: ダイジェスト生成パイプライン実行
+              env:
+                  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+                  GH_ACTIVITY_TOKEN: ${{ secrets.GH_ACTIVITY_TOKEN }}
+                  NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+                  WORDPRESS_URL: ${{ secrets.WORDPRESS_URL }}
+                  WORDPRESS_USERNAME: ${{ secrets.WORDPRESS_USERNAME }}
+                  WORDPRESS_APP_PASSWORD: ${{ secrets.WORDPRESS_APP_PASSWORD }}
+                  TARGET_WEEK: ${{ github.event.inputs.target_week }}
+                  SHOULD_PUBLISH: ${{ github.event_name == 'schedule' || github.event.inputs.publish == 'true' }}
+              run: |
+                  args=()
+                  if [ -n "$TARGET_WEEK" ]; then
+                      args+=(--target-week "$TARGET_WEEK")
+                  fi
+                  if [ "$SHOULD_PUBLISH" = "true" ]; then
+                      args+=(--publish)
+                  fi
+                  uv run python digest.py "${args[@]}"
+
+            - name: アーティファクトの保存
+              if: always()
+              uses: actions/upload-artifact@v4
+              with:
+                  name: activity-digest-markdown
+                  path: artifacts/*.md
+                  if-no-files-found: ignore

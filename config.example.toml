@@ -1,0 +1,70 @@
+# 日付境界と収集結果の表示に使うタイムゾーン
+timezone = "Asia/Tokyo"
+
+# 最終記事へ必ず付与する開示文。空文字の場合は組み込み文へ戻る
+disclosure = "※ この記事はAIによって自動生成されており、事実と異なる内容を含む可能性があります。公開は人間が内容を確認したうえで行います。"
+
+# 生成した Markdown の保存先
+output_dir = "artifacts"
+
+# 追加で読み込むイベント JSON。不要なら空配列にする
+local_files = ["data/events.json"]
+
+# 登録地点以外の座標に置き換える公開ラベル
+default_location_label = "外出先"
+
+[period]
+# 実行日から end_offset_days 日前を末尾として、何日分を集めるか
+days = 7
+end_offset_days = 1
+
+[gemini]
+# 段階別モデルを省略した場合に使うモデル
+model = "gemini-3.7-flash"
+# stage1_model = "gemini-3.7-flash"
+# stage2_model = "gemini-3.7-flash"
+# stage3_model = "gemini-3.7-flash"
+
+[prompts]
+inspector = "prompts/inspector.md"
+writer = "prompts/writer.md"
+editor = "prompts/editor.md"
+
+[github]
+username = "octocat"
+# owner/repository の完全一致。大文字と小文字は区別しない
+blacklist = ["octocat/secret-notes", "octocat/private-tools"]
+
+[notion]
+# 収集を許可するデータソースだけを列挙する
+data_source_ids = [
+    "d9b4b0e1-6284-406e-8215-21d1e43c68a4",
+    "f1a2b3c4-d5e6-47f8-a9b0-c1d2e3f4a5b6",
+]
+
+[wordpress]
+slug_prefix = "activity-digest"
+
+[wordpress.post_defaults]
+# WordPress REST API の ID。不要な項目は削除できる
+categories = [1]
+tags = []
+# author = 1
+comment_status = "closed"
+ping_status = "closed"
+format = "standard"
+
+[[locations]]
+# name は設定を識別するためだけに使い、AIへは渡さない
+name = "大学"
+label = "大学周辺"
+lat = 35.6812
+lon = 139.7671
+radius_meters = 1000
+
+[[locations]]
+name = "自宅"
+label = "居住エリア"
+lat = 35.6580
+lon = 139.7514
+radius_meters = 500

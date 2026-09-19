@@ -1,0 +1,22 @@
+{
+    "gitignore": true,
+    "ignores": ["node_modules/**", ".venv/**", ".dvc/**"],
+    "config": {
+        "default": true,
+        "MD003": { "style": "atx" },
+        "MD004": { "style": "dash" },
+        "MD007": { "indent": 4 },
+        "MD009": { "br_spaces": 0 },
+        "MD013": false,
+        "MD024": { "siblings_only": true },
+        "MD029": { "style": "one" },
+        "MD033": false,
+        "MD034": true,
+        "MD035": { "style": "---" },
+        "MD041": true,
+        "MD046": { "style": "fenced" },
+        "MD048": { "style": "backtick" },
+        "MD049": { "style": "underscore" },
+        "MD050": { "style": "asterisk" }
+    }
+}
