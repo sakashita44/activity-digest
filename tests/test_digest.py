@@ -1,8 +1,10 @@
 import json
+import logging
 import os
 import tempfile
 import unittest
 from datetime import datetime
+from logging.handlers import BufferingHandler
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
@@ -17,10 +19,12 @@ from activity_digest.ai import (
 )
 from activity_digest.app import (
     FIXED_DISCLOSURE,
+    PipelineStageError,
     format_article_markdown,
     get_target_range,
     load_config,
     publish_wordpress_draft,
+    report_failure,
     resolve_model,
     run_pipeline,
 )
@@ -411,6 +415,57 @@ class TestDigestPipeline(unittest.TestCase):
             {"title": "T", "summary": "S", "sections": []}, ""
         )
         self.assertIn(FIXED_DISCLOSURE, markdown_text)
+
+    def test_http_request_urls_are_not_logged(self) -> None:
+        handler = BufferingHandler(capacity=1000)
+        root = logging.getLogger()
+        original_level = root.level
+        # pytest 環境では basicConfig が効かないため、本番と同じ INFO に揃える
+        root.setLevel(logging.INFO)
+        root.addHandler(handler)
+        client = httpx.Client(
+            transport=httpx.MockTransport(lambda _: httpx.Response(200, json=[]))
+        )
+        try:
+            client.get("https://api.github.com/repos/secret-org/private-repo")
+        finally:
+            root.removeHandler(handler)
+            root.setLevel(original_level)
+        self.assertFalse(
+            any("private-repo" in record.getMessage() for record in handler.buffer)
+        )
+
+    def test_failure_log_hides_error_details_unless_detailed(self) -> None:
+        client = httpx.Client(
+            transport=httpx.MockTransport(
+                lambda _: httpx.Response(500, text="secret-org/private-repo")
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.toml"
+            config_path.write_text(config_text(), encoding="utf-8")
+            with (
+                patch.dict(os.environ, {"GH_ACTIVITY_TOKEN": "token"}),
+                self.assertRaises(PipelineStageError) as raised,
+            ):
+                run_pipeline(
+                    str(config_path),
+                    "2026-W36",
+                    genai_client=MagicMock(),
+                    http_client=client,
+                )
+        self.assertEqual(raised.exception.stage, "collect")
+
+        with self.assertLogs("activity-digest", "ERROR") as logs:
+            report_failure(raised.exception, detailed=False)
+        self.assertEqual(
+            logs.output,
+            ["ERROR:activity-digest:Pipeline failed at collect: HTTPStatusError"],
+        )
+
+        with self.assertLogs("activity-digest", "ERROR") as logs:
+            report_failure(raised.exception, detailed=True)
+        self.assertIn("api.github.com", "\n".join(logs.output))
 
 
 if __name__ == "__main__":
