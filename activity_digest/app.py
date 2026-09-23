@@ -20,13 +20,7 @@ from activity_digest.ai import (
     run_stage2_writer,
     run_stage3_editor,
 )
-from activity_digest.sources import (
-    collect_github_events,
-    collect_notion_events,
-    ensure_no_coordinates,
-    load_local_events,
-    sanitize_and_order_events,
-)
+from activity_digest.collectors import SourceDocument, github, notion
 
 TOKYO_TZ = ZoneInfo("Asia/Tokyo")
 FIXED_DISCLOSURE = "※ この記事はAIによって自動生成されており、事実と異なる内容を含む可能性があります。公開は人間が内容を確認したうえで行います。"
@@ -165,29 +159,20 @@ def resolve_model(config: dict[str, Any], stage_key: str | None = None) -> str:
     )
 
 
+def format_article_title(start_dt: datetime, end_dt: datetime) -> str:
+    return f"{start_dt:%Y-%m-%d}〜{end_dt:%Y-%m-%d}の活動記録"
+
+
 def format_article_markdown(
-    draft: dict[str, Any], disclosure: str = FIXED_DISCLOSURE
+    title: str, content: str, disclosure: str = FIXED_DISCLOSURE
 ) -> str:
-    return f"# {draft.get('title', '')}\n\n" + format_article_body(draft, disclosure)
+    return f"# {title}\n\n" + format_article_body(content, disclosure)
 
 
-def format_article_body(
-    draft: dict[str, Any], disclosure: str = FIXED_DISCLOSURE
-) -> str:
+def format_article_body(content: str, disclosure: str = FIXED_DISCLOSURE) -> str:
     # WordPress はタイトルを別フィールドで表示するため、本文にはタイトル見出しを含めない
     required_disclosure = disclosure.strip() or FIXED_DISCLOSURE
-    lines = [str(draft.get("summary", "")), ""]
-    for section in draft.get("sections", []):
-        lines.extend(
-            [
-                f"## {section.get('heading', '')}",
-                "",
-                str(section.get("content", "")),
-                "",
-            ]
-        )
-    lines.extend(["---", required_disclosure, ""])
-    return "\n".join(lines)
+    return f"{content.strip()}\n\n---\n\n{required_disclosure}\n"
 
 
 def publish_wordpress_draft(
@@ -244,14 +229,22 @@ def publish_wordpress_draft(
             http_client.close()
 
 
+def dump_intermediate(dump_dir: str | None, name: str, text: str) -> None:
+    if dump_dir is None:
+        return
+    path = Path(dump_dir) / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
 def run_pipeline(
     config_path: str = "config.toml",
     target_week: str | None = None,
     publish: bool = False,
     output_override: str | None = None,
-    local_events_path: str | None = None,
     from_date: str | None = None,
     to_date: str | None = None,
+    dump_dir: str | None = None,
     ref_date: datetime | None = None,
     genai_client: Any | None = None,
     http_client: httpx.Client | None = None,
@@ -272,52 +265,62 @@ def run_pipeline(
         weekly_slug = (
             f"{wordpress_config.get('slug_prefix', 'activity-digest')}-{slug_suffix}"
         )
-        local_files = list(config.get("local_files", []))
-        if local_events_path:
-            local_files.append(local_events_path)
+        title = format_article_title(start_dt, end_dt)
 
     with pipeline_stage("collect"):
-        events = (
-            collect_github_events(config, start_dt, end_dt, client=http_client)
-            + collect_notion_events(config, start_dt, end_dt, client=http_client)
-            + load_local_events(local_files, start_dt, end_dt, tz=timezone)
+        documents: list[SourceDocument] = []
+        for collector in (github, notion):
+            documents.extend(
+                collector.collect(config, start_dt, end_dt, client=http_client)
+            )
+    if not documents:
+        logger.info("No activity records found for %s. Skipping.", slug_suffix)
+        return None
+    for document in documents:
+        logger.info(
+            "Source %s: %d records collected", document.name, len(document.records)
         )
-        sanitized = sanitize_and_order_events(events, config)
-        if not sanitized:
-            logger.info("No activity records found for %s. Skipping.", slug_suffix)
-            return None
-        ensure_no_coordinates(sanitized)
-    logger.info("Collected %d events", len(sanitized))
+    dump_intermediate(
+        dump_dir,
+        "sources.md",
+        "\n\n".join(document.to_markdown() for document in documents),
+    )
 
     prompt_config = config.get("prompts", {})
     with pipeline_stage("stage1-inspector"):
         ai_client = genai_client or genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-        approved = run_stage1_inspector(
+        material = run_stage1_inspector(
             ai_client,
             resolve_model(config, "stage1_model"),
-            sanitized,
+            documents,
             prompt_path=prompt_config.get("inspector", "prompts/inspector.md"),
         )
-    if not approved:
-        logger.info("Stage 1 approved no events. Skipping.")
+    dump_intermediate(dump_dir, "stage1.md", material)
+    if not material:
+        logger.info("Stage 1 kept no publishable material. Skipping.")
         return None
+    logger.info("Stage 1 completed")
     with pipeline_stage("stage2-writer"):
         draft = run_stage2_writer(
             ai_client,
             resolve_model(config, "stage2_model"),
-            approved,
-            slug_suffix,
+            material,
+            f"{start_dt:%Y-%m-%d}〜{end_dt:%Y-%m-%d}",
             prompt_path=prompt_config.get("writer", "prompts/writer.md"),
         )
+    dump_intermediate(dump_dir, "stage2.md", draft)
+    logger.info("Stage 2 completed")
     with pipeline_stage("stage3-editor"):
-        final_draft = run_stage3_editor(
+        content = run_stage3_editor(
             ai_client,
             resolve_model(config, "stage3_model"),
             draft,
             prompt_path=prompt_config.get("editor", "prompts/editor.md"),
         )
+    dump_intermediate(dump_dir, "stage3.md", content)
+    logger.info("Stage 3 completed")
     disclosure = str(config.get("disclosure", FIXED_DISCLOSURE))
-    final_markdown = format_article_markdown(final_draft, disclosure)
+    final_markdown = format_article_markdown(title, content, disclosure)
 
     with pipeline_stage("write-output"):
         output_path = Path(
@@ -339,8 +342,8 @@ def run_pipeline(
                 wp_user,
                 wp_password,
                 weekly_slug,
-                str(final_draft.get("title", "")),
-                format_article_body(final_draft, disclosure),
+                title,
+                format_article_body(content, disclosure),
                 wordpress_config.get("post_defaults", {}),
                 client=http_client,
             )
@@ -368,7 +371,11 @@ def main() -> None:
     parser.add_argument("--to", dest="to_date", default=None)
     parser.add_argument("--publish", action="store_true")
     parser.add_argument("--output", default=None)
-    parser.add_argument("--local-events", default=None)
+    parser.add_argument(
+        "--dump-dir",
+        default=None,
+        help="Source document と各段階の出力を書き出すディレクトリ。ローカル確認用",
+    )
     args = parser.parse_args()
     try:
         run_pipeline(
@@ -376,9 +383,9 @@ def main() -> None:
             args.target_week,
             args.publish,
             args.output,
-            args.local_events,
             args.from_date,
             args.to_date,
+            dump_dir=args.dump_dir,
         )
     except Exception as error:
         report_failure(error, detailed=os.getenv("GITHUB_ACTIONS") != "true")

@@ -14,13 +14,14 @@ import httpx
 from activity_digest.ai import (
     render_prompt,
     run_stage1_inspector,
-    run_stage2_writer,
     run_stage3_editor,
+    strip_code_fence,
 )
 from activity_digest.app import (
     FIXED_DISCLOSURE,
     PipelineStageError,
     format_article_markdown,
+    format_article_title,
     get_target_range,
     load_config,
     publish_wordpress_draft,
@@ -28,23 +29,17 @@ from activity_digest.app import (
     resolve_model,
     run_pipeline,
 )
-from activity_digest.sources import (
-    COORD_KEYS,
-    collect_github_events,
-    collect_notion_events,
-    ensure_no_coordinates,
-    sanitize_and_order_events,
-)
+from activity_digest.collectors import SourceDocument, github, notion
 
 TOKYO_TZ = ZoneInfo("Asia/Tokyo")
+PERIOD_START = datetime(2026, 9, 1, tzinfo=TOKYO_TZ)
+PERIOD_END = datetime(2026, 9, 7, 23, 59, tzinfo=TOKYO_TZ)
 
 
 def config_text(output_dir: str = "artifacts") -> str:
     return f'''timezone = "Asia/Tokyo"
 output_dir = "{output_dir.replace("\\", "/")}"
 disclosure = ""
-local_files = []
-default_location_label = "外出先"
 
 [period]
 days = 7
@@ -66,14 +61,28 @@ slug_prefix = "activity-digest"
 [wordpress.post_defaults]
 categories = [3]
 comment_status = "closed"
-
-[[locations]]
-name = "オフィス"
-label = "都内オフィス街"
-lat = 35.6812
-lon = 139.7671
-radius_meters = 1000
 '''
+
+
+def github_event(event_id: str, repo: str, created_at: str) -> dict[str, object]:
+    return {
+        "id": event_id,
+        "type": "PushEvent",
+        "created_at": created_at,
+        "repo": {"name": repo},
+        "payload": {},
+    }
+
+
+def ai_responses(*texts: str) -> MagicMock:
+    client = MagicMock()
+    responses: list[MagicMock] = []
+    for text in texts:
+        response = MagicMock()
+        response.text = text
+        responses.append(response)
+    client.models.generate_content.side_effect = responses
+    return client
 
 
 class TestDigestPipeline(unittest.TestCase):
@@ -87,16 +96,6 @@ class TestDigestPipeline(unittest.TestCase):
                 "blacklist": ["secret-org/private-repo", "my-org/core-secret"],
             },
             "notion": {"data_source_ids": ["ds-1", "ds-2"]},
-            "locations": [
-                {
-                    "name": "オフィス",
-                    "label": "都内オフィス街",
-                    "lat": 35.6812,
-                    "lon": 139.7671,
-                    "radius_meters": 1000,
-                }
-            ],
-            "default_location_label": "外出先",
             "wordpress": {"slug_prefix": "activity-digest"},
         }
 
@@ -111,6 +110,9 @@ class TestDigestPipeline(unittest.TestCase):
         self.assertEqual(start.date().isoformat(), "2026-08-31")
         self.assertEqual(end.date().isoformat(), "2026-09-06")
         self.assertEqual(suffix, "2026-w36")
+        self.assertEqual(
+            format_article_title(start, end), "2026-08-31〜2026-09-06の活動記録"
+        )
 
         start, end, suffix = get_target_range(
             self.config,
@@ -127,43 +129,42 @@ class TestDigestPipeline(unittest.TestCase):
         with self.assertRaises(ValueError):
             get_target_range(self.config, from_date="2026-08-02")
 
-    def test_collection_filters(self) -> None:
-        github_data = [
-            {
-                "id": "1",
-                "type": "PushEvent",
-                "created_at": "2026-09-02T10:00:00Z",
-                "repo": {"name": "my-org/public-project"},
-                "payload": {"action": "push"},
-            },
-            {
-                "id": "2",
-                "type": "PushEvent",
-                "created_at": "2026-09-02T11:00:00Z",
-                "repo": {"name": "secret-org/private-repo"},
-                "payload": {"action": "push"},
-            },
-            {
-                "id": "3",
-                "type": "PushEvent",
-                "created_at": "2026-09-02T12:00:00Z",
-                "repo": {"name": "my-org/CORE-SECRET"},
-                "payload": {"action": "push"},
-            },
+    def test_github_document_excludes_blacklisted_repositories(self) -> None:
+        events = [
+            github_event("1", "my-org/public-project", "2026-09-02T10:00:00Z"),
+            github_event("2", "my-org/public-project", "2026-09-02T11:00:00Z"),
+            github_event("3", "secret-org/private-repo", "2026-09-02T11:00:00Z"),
+            github_event("4", "my-org/CORE-SECRET", "2026-09-02T12:00:00Z"),
         ]
         client = httpx.Client(
-            transport=httpx.MockTransport(
-                lambda _: httpx.Response(200, json=github_data)
-            )
+            transport=httpx.MockTransport(lambda _: httpx.Response(200, json=events))
         )
-        start = datetime(2026, 9, 1, tzinfo=TOKYO_TZ)
-        end = datetime(2026, 9, 7, 23, 59, tzinfo=TOKYO_TZ)
-        events = collect_github_events(self.config, start, end, client=client)
-        self.assertEqual([event["id"] for event in events], ["gh-1"])
+        documents = github.collect(self.config, PERIOD_START, PERIOD_END, client)
+        self.assertEqual(len(documents), 1)
+        text = documents[0].to_markdown()
+        self.assertIn("### my-org/public-project", text)
+        self.assertIn("- 2026-09-02: PushEvent ×2", text)
+        self.assertNotIn("private-repo", text)
+        self.assertNotIn("CORE-SECRET", text)
 
+    def test_github_allowlist_limits_repositories(self) -> None:
+        events = [
+            github_event("1", "me/Allowed", "2026-09-02T10:00:00Z"),
+            github_event("2", "me/other", "2026-09-02T10:00:00Z"),
+        ]
+        client = httpx.Client(
+            transport=httpx.MockTransport(lambda _: httpx.Response(200, json=events))
+        )
+        config = {"github": {"username": "me", "allowlist": ["me/allowed"]}}
+        documents = github.collect(config, PERIOD_START, PERIOD_END, client)
+        text = documents[0].to_markdown()
+        self.assertIn("me/Allowed", text)
+        self.assertNotIn("me/other", text)
+
+    def test_notion_document_uses_only_configured_data_sources(self) -> None:
         queried: list[str] = []
 
-        def notion_handler(request: httpx.Request) -> httpx.Response:
+        def handler(request: httpx.Request) -> httpx.Response:
             queried.append(str(request.url))
             return httpx.Response(
                 200,
@@ -171,6 +172,7 @@ class TestDigestPipeline(unittest.TestCase):
                     "results": [
                         {
                             "id": "p1",
+                            "url": "https://www.notion.so/private-page",
                             "created_time": "2026-09-02T15:00:00Z",
                             "properties": {
                                 "Name": {
@@ -184,157 +186,81 @@ class TestDigestPipeline(unittest.TestCase):
                 },
             )
 
-        notion_client = httpx.Client(transport=httpx.MockTransport(notion_handler))
+        client = httpx.Client(transport=httpx.MockTransport(handler))
         with patch.dict(os.environ, {"NOTION_API_KEY": "fake-key"}):
-            notion_events = collect_notion_events(
-                self.config,
-                start,
-                end,
-                client=notion_client,
-                requested_ids=["ds-1", "ds-unauthorized"],
-            )
-        self.assertEqual(len(notion_events), 1)
-        self.assertTrue(any("ds-1" in url for url in queried))
-        self.assertFalse(any("ds-unauthorized" in url for url in queried))
+            documents = notion.collect(self.config, PERIOD_START, PERIOD_END, client)
+        self.assertEqual(len(queried), 2)
+        self.assertTrue(all("ds-1" in u or "ds-2" in u for u in queried))
+        text = documents[0].to_markdown()
+        self.assertIn("### Book", text)
+        self.assertIn("- URL: https://example.com", text)
+        self.assertNotIn("notion.so", text)
 
-    def test_coordinate_redaction(self) -> None:
-        raw_events = [
-            {
-                "id": "loc-1",
-                "timestamp": "2026-09-02T12:00:00+09:00",
-                "location": {"lat": 35.6813, "lon": 139.7670},
-                "title": "出社",
-                "details": "座標 35.6813, 139.7670 付近",
-            },
-            {
-                "id": "loc-2",
-                "timestamp": "2026-09-03T18:00:00+09:00",
-                "location": {"lat": 34.6937, "lon": 135.5023},
-                "title": "出張",
-                "details": "移動",
-            },
-        ]
-        sanitized = sanitize_and_order_events(raw_events, self.config)
-        self.assertEqual(sanitized[0]["location_label"], "都内オフィス街")
-        self.assertEqual(sanitized[1]["location_label"], "外出先")
-        self.assertIn("[座標マスク]", sanitized[0]["details"])
-        self.assertTrue(
-            all(key not in event for event in sanitized for key in COORD_KEYS)
+    def test_source_document_markdown_has_name_context_and_records(self) -> None:
+        document = SourceDocument("Work Log", "実作業ログである。", ["### A", "### B"])
+        self.assertEqual(
+            document.to_markdown(),
+            "# Work Log\n\n実作業ログである。\n\n## Records\n\n### A\n\n### B",
         )
-        ensure_no_coordinates(sanitized)
 
-    def test_coordinates_in_non_string_values_are_redacted(self) -> None:
-        raw_events = [
-            {
-                "id": "loc-3",
-                "timestamp": "2026-09-02T12:00:00+09:00",
-                "title": ["散歩", 35.681234],
-                "details": {"lat": 35.681234, "lon": 139.767123},
-            }
+    def test_stage1_receives_every_source_with_its_context(self) -> None:
+        client = ai_responses("- 作業した")
+        documents = [
+            SourceDocument("GitHub", "開発の履歴である。", ["### repo"]),
+            SourceDocument("Inbox", "保存した情報である。", ["### article"]),
         ]
-        sanitized = sanitize_and_order_events(raw_events, self.config)
-        self.assertNotIn("35.681234", json.dumps(sanitized))
-        self.assertNotIn("139.767123", json.dumps(sanitized))
-        ensure_no_coordinates(sanitized)
-        with self.assertRaises(ValueError):
-            ensure_no_coordinates([{"id": "x", "details": {"note": 35.681234}}])
-        with self.assertRaises(ValueError):
-            ensure_no_coordinates([{"id": "y", "details": "35.681, 139.767 付近"}])
+        result = run_stage1_inspector(client, "model", documents)
+        prompt = client.models.generate_content.call_args.kwargs["contents"]
+        for expected in ("# GitHub", "開発の履歴である。", "# Inbox", "保存した情報"):
+            self.assertIn(expected, prompt)
+        self.assertEqual(result, "- 作業した")
 
-    def test_event_id_boundaries(self) -> None:
-        client = MagicMock()
-        response = MagicMock()
-        client.models.generate_content.return_value = response
-        events = [
-            {"id": "ev-1", "title": "Task", "timestamp": "2026-09-02T10:00:00+09:00"}
-        ]
+    def test_empty_editor_output_is_an_error(self) -> None:
+        with self.assertRaises(ValueError):
+            run_stage3_editor(ai_responses("  "), "model", "草案")
+        self.assertEqual(strip_code_fence("```markdown\n## 開発\n```"), "## 開発")
 
-        response.parsed = {"events": [{"id": "ev-fake", "title": "Fake"}]}
-        with self.assertRaises(ValueError):
-            run_stage1_inspector(client, "model", events)
-        response.parsed = {
-            "title": "T",
-            "summary": "S",
-            "sections": [{"heading": "H", "content": "C", "event_ids": ["ev-fake"]}],
-        }
-        with self.assertRaises(ValueError):
-            run_stage2_writer(client, "model", events, "2026-w36")
-        draft = {
-            "title": "T",
-            "summary": "S",
-            "sections": [{"heading": "H", "content": "C", "event_ids": ["ev-1"]}],
-        }
-        response.parsed = {
-            "title": "T2",
-            "summary": "S2",
-            "sections": [
-                {"heading": "H", "content": "C", "event_ids": ["ev-1", "ev-added"]}
-            ],
-        }
-        with self.assertRaises(ValueError):
-            run_stage3_editor(client, "model", draft)
-
-    def test_pipeline_calls_three_agents_and_requires_disclosure(self) -> None:
+    def test_pipeline_runs_three_stages_and_writes_template_parts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config_path = root / "config.toml"
             config_path.write_text(
                 config_text(str(root / "artifacts")), encoding="utf-8"
             )
-            github_item = [
-                {
-                    "id": "10",
-                    "type": "PushEvent",
-                    "created_at": "2026-09-02T10:00:00Z",
-                    "repo": {"name": "my-org/public-project"},
-                    "payload": {"action": "push"},
-                }
+            events = [
+                github_event("10", "my-org/public-project", "2026-09-02T10:00:00Z")
             ]
             http_client = httpx.Client(
                 transport=httpx.MockTransport(
                     lambda request: httpx.Response(
                         200,
-                        json=github_item
+                        json=events
                         if "api.github.com" in str(request.url)
                         else {"results": []},
                     )
                 )
             )
-            ai_client = MagicMock()
-            responses = [MagicMock(), MagicMock(), MagicMock()]
-            responses[0].parsed = {
-                "events": [{"id": "gh-10", "title": "Push", "source": "github"}]
-            }
-            responses[1].parsed = {
-                "title": "草案",
-                "summary": "概要",
-                "sections": [
-                    {"heading": "開発", "content": "作業内容", "event_ids": ["gh-10"]}
-                ],
-            }
-            responses[2].parsed = {
-                "title": "推敲後草案",
-                "summary": "改善概要",
-                "sections": [
-                    {
-                        "heading": "開発",
-                        "content": "洗練された作業内容",
-                        "event_ids": ["gh-10"],
-                    }
-                ],
-            }
-            ai_client.models.generate_content.side_effect = responses
+            ai_client = ai_responses("- 開発した", "## 開発\n\n草案", "## 開発\n\n本文")
 
             result = run_pipeline(
                 config_path=str(config_path),
                 target_week="2026-W36",
+                dump_dir=str(root / "dump"),
                 genai_client=ai_client,
                 http_client=http_client,
             )
             self.assertEqual(ai_client.models.generate_content.call_count, 3)
-            self.assertIn(FIXED_DISCLOSURE, result or "")
+            self.assertEqual(
+                result,
+                "# 2026-08-31〜2026-09-06の活動記録\n\n## 開発\n\n本文\n\n---\n\n"
+                f"{FIXED_DISCLOSURE}\n",
+            )
             self.assertTrue(
                 (root / "artifacts" / "activity-digest-2026-w36.md").is_file()
+            )
+            self.assertEqual(
+                sorted(path.name for path in (root / "dump").iterdir()),
+                ["sources.md", "stage1.md", "stage2.md", "stage3.md"],
             )
 
     def test_empty_period_skips_gemini(self) -> None:
@@ -350,6 +276,21 @@ class TestDigestPipeline(unittest.TestCase):
             )
         self.assertIsNone(result)
         ai_client.models.generate_content.assert_not_called()
+
+    def test_no_publishable_material_skips_writer(self) -> None:
+        events = [github_event("1", "my-org/public-project", "2026-09-02T10:00:00Z")]
+        client = httpx.Client(
+            transport=httpx.MockTransport(lambda _: httpx.Response(200, json=events))
+        )
+        ai_client = ai_responses("")
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.toml"
+            config_path.write_text(config_text(directory), encoding="utf-8")
+            result = run_pipeline(
+                str(config_path), "2026-W36", genai_client=ai_client, http_client=client
+            )
+        self.assertIsNone(result)
+        self.assertEqual(ai_client.models.generate_content.call_count, 1)
 
     def test_wordpress_defaults_are_allowlisted_and_draft_is_fixed(self) -> None:
         created: list[dict[str, object]] = []
@@ -406,15 +347,14 @@ class TestDigestPipeline(unittest.TestCase):
         self.assertEqual(posted, [])
 
     def test_prompt_model_and_disclosure_configuration(self) -> None:
-        rendered = render_prompt("{{week}} {{events}}", {"week": "W", "events": "[]"})
-        self.assertEqual(rendered, "W []")
+        rendered = render_prompt(
+            "{{period}} {{material}}", {"period": "P", "material": "M"}
+        )
+        self.assertEqual(rendered, "P M")
         config = {"gemini": {"model": "global", "stage1_model": "inspector"}}
         self.assertEqual(resolve_model(config, "stage1_model"), "inspector")
         self.assertEqual(resolve_model(config, "stage2_model"), "global")
-        markdown_text = format_article_markdown(
-            {"title": "T", "summary": "S", "sections": []}, ""
-        )
-        self.assertIn(FIXED_DISCLOSURE, markdown_text)
+        self.assertIn(FIXED_DISCLOSURE, format_article_markdown("T", "本文", ""))
 
     def test_http_request_urls_are_not_logged(self) -> None:
         handler = BufferingHandler(capacity=1000)

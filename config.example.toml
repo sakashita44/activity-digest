@@ -7,12 +7,6 @@ disclosure = "※ この記事はAIによって自動生成されており、事
 # 生成した Markdown の保存先
 output_dir = "artifacts"
 
-# 追加で読み込むイベント JSON。不要なら空配列にする
-local_files = ["data/events.json"]
-
-# 登録地点以外の座標に置き換える公開ラベル
-default_location_label = "外出先"
-
 [period]
 # 実行日から end_offset_days 日前を末尾として、何日分を集めるか
 days = 7
@@ -32,7 +26,9 @@ editor = "prompts/editor.md"
 
 [github]
 username = "octocat"
-# owner/repository の完全一致。大文字と小文字は区別しない
+# owner/repository の完全一致で、大文字と小文字は区別しない
+# allowlist を空にすると全リポジトリを収集する。blacklist は allowlist より優先する
+allowlist = []
 blacklist = ["octocat/secret-notes", "octocat/private-tools"]
 
 [notion]
@@ -53,18 +49,3 @@ tags = []
 comment_status = "closed"
 ping_status = "closed"
 format = "standard"
-
-[[locations]]
-# name は設定を識別するためだけに使い、AIへは渡さない
-name = "大学"
-label = "大学周辺"
-lat = 35.6812
-lon = 139.7671
-radius_meters = 1000
-
-[[locations]]
-name = "自宅"
-label = "居住エリア"
-lat = 35.6580
-lon = 139.7514
-radius_meters = 500
