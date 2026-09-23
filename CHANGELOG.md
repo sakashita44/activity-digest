@@ -6,7 +6,9 @@
 
 ### Added
 
-- GitHub、Notion、ローカルJSONの活動記録から週次の日記をGeminiで生成し、WordPressへ下書き保存するパイプラインを追加した (#2)
+- GitHubとNotionの活動記録から週次の活動記録をGeminiで生成し、WordPressへ下書き保存するパイプラインを追加した。AIへは、ソースごとの前提を含むSource documentを渡す。記事タイトルは対象期間から生成する (#2, #5)
+- GitHubの収集対象リポジトリを `github.allowlist` で限定できるようにした (#5)
+- `--dump-dir` で、AIへ渡したSource documentと各段階の出力をローカルに書き出せるようにした (#5)
 
 ### Security
 
