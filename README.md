@@ -1,20 +1,25 @@
 # activity-digest
 
-GitHub、Notion、任意のローカルイベントから活動記録を集め、Geminiで週次の日記を生成してWordPressへ下書き保存する個人用パイプラインである。記事にはAI生成であることと、事実と異なる可能性があることを示す開示文を必ず付ける。
+GitHub、Notion、ローカルイベントの活動記録から、LLM を活用して週次の活動日記を生成し、WordPress へ保存する個人用パイプライン。
 
-## 処理の流れ
+## 特徴
 
-1. GitHubのユーザーイベント、許可したNotionデータソース、ローカルJSONを収集する。
-1. GitHubのブラックリスト、Notionのホワイトリスト、座標のラベル化をコードで適用する。
-1. Geminiを独立したコンテキストで3回呼び、情報検査、日記の執筆、文体の推敲を順に行う。
-1. イベントIDと座標を各境界で検査し、開示文を付けてMarkdownへ保存する。
-1. 指定時だけWordPress REST APIへ下書きとして登録する。同じスラッグの下書きがあれば更新する。同じスラッグの投稿が公開済みなど下書き以外の状態なら、人が確認・編集した記事を守るため更新せずエラーで終了する。
-
-対象期間に活動がなければGeminiを呼ばず、記事も作らない。
+- 複数データソースの収集: GitHub のユーザーイベント、Notion の指定データソース、任意のローカル JSON イベントに対応
+- プライバシー保護: 位置情報の粗粒度ラベル化（座標マスキング）や除外リストによる機微情報の保護
+- 段階的な AI 生成: 情報検査、草案執筆、文体推敲の 3 段階処理（各段階でモデル設定が可能）
+- 安全な WordPress 連携: 下書き保存による事前確認、同一週スラッグによる更新、公開済み記事の誤上書き防止に対応
+- 自動運用: GitHub Actions による週次定期実行と、手動実行・期間指定実行に対応
 
 ## セットアップ
 
-Python 3.12と[uv](https://docs.astral.sh/uv/)を使用する。
+### 前提条件
+
+- Python 3.12
+- [uv](https://docs.astral.sh/uv/)
+
+### 手順
+
+依存関係のインストールと設定ファイルの準備を行う。
 
 ```bash
 uv sync --dev
@@ -22,62 +27,77 @@ cp config.example.toml config.toml
 cp .env.example .env
 ```
 
-`config.toml` と `.env` はGit管理の対象外である。認証情報は `.env` または実行環境へ設定する。
+`config.toml` と `.env` は Git の管理対象外である。認証情報は `.env` または実行環境の環境変数に設定する。
 
-- `GEMINI_API_KEY`: Google AI APIキー
-- `GH_ACTIVITY_TOKEN`: GitHubトークン。未設定時は `GITHUB_TOKEN` を使う
-- `NOTION_API_KEY`: Notionインテグレーションシークレット
-- `WORDPRESS_URL`: WordPressサイトURL
-- `WORDPRESS_USERNAME`: WordPressユーザー名
-- `WORDPRESS_APP_PASSWORD`: WordPressアプリケーションパスワード
-- `GEMINI_MODEL`: TOMLの共通モデルを一時的に上書きする任意値
+### 環境変数
 
-## 設定できる範囲
+| 変数名                   | 必須 | 説明                                                   |
+| :----------------------- | :--- | :----------------------------------------------------- |
+| `GEMINI_API_KEY`         | 必須 | Google AI API キー                                     |
+| `GH_ACTIVITY_TOKEN`      | 任意 | GitHub トークン（未設定時は `GITHUB_TOKEN` を使用）    |
+| `NOTION_API_KEY`         | 任意 | Notion インテグレーションシークレット（Notion 連携時） |
+| `WORDPRESS_URL`          | 任意 | WordPress サイトの URL（WordPress 連携時）             |
+| `WORDPRESS_USERNAME`     | 任意 | WordPress ユーザー名                                   |
+| `WORDPRESS_APP_PASSWORD` | 任意 | WordPress アプリケーションパスワード                   |
+| `GEMINI_MODEL`           | 任意 | TOML の共通モデルを一時的に上書きするモデル名          |
 
-コメント付きの [config.example.toml](config.example.toml) を複製して設定する。
+### 設定ファイル
 
-- 基本設定: タイムゾーン、出力先、開示文、追加イベントJSON
-- 収集期間: `period.days` と `period.end_offset_days`
-- Gemini: 共通モデル、3段階それぞれのモデル、各プロンプトのファイルパス
-- GitHub: 対象ユーザー、除外リポジトリの完全一致リスト
-- Notion: 収集を許可するデータソースID
-- 位置情報: 登録地点の座標、半径、公開用の曖昧なラベル、登録外の既定ラベル
-- WordPress: スラッグ接頭辞、カテゴリーID、タグID、投稿者ID、コメント、ピンバック、投稿フォーマット
+設定項目の詳細は、コメント付きの [config.example.toml](config.example.toml) を参照のこと。セットアップで複製した `config.toml` を必要に応じて編集する。
 
-WordPressの `status` は常に `draft` である。設定に `status`、`slug`、`title`、`content` を加えても無視する。開示文は文面を変更できるが、空にすると組み込みの文面へ戻る。
+- 基本設定: タイムゾーン、出力先、開示文、追加イベント JSON
+- 収集期間: 日数（`period.days`）と終了オフセット日数（`period.end_offset_days`）
+- Gemini: 共通モデル、3 段階それぞれのモデル、各プロンプトファイル（[prompts/](prompts/)）
+- GitHub: 対象ユーザー、除外リポジトリリスト
+- Notion: 収集を許可するデータソース ID
+- 位置情報: 登録地点の座標、判定半径、公開用ラベル、既定ラベル
+- WordPress: スラッグ接頭辞、カテゴリー ID、タグ ID、投稿者 ID など
 
-プロンプト本文は [prompts/inspector.md](prompts/inspector.md)、[prompts/writer.md](prompts/writer.md)、[prompts/editor.md](prompts/editor.md) にある。スクリプトを変更せず、役割ごとの指示を編集できる。
+## 使い方
 
-## 対象期間
+### CLI での実行
 
-通常実行では、実行日から `period.end_offset_days` 日前を末尾とし、そこから `period.days` 日間を収集する。既定値は実行前日までの7日間である。月曜実行なら前週の月曜から日曜までになる。
-
-CLIでは次の順に設定を上書きする。
-
-1. `--from` と `--to` の組み合わせ
-1. `--target-week`
-1. TOMLの `[period]`
-
-`--from` と `--to` は必ず同時に指定する。
-
-ローカルJSONのイベントは `timestamp` で期間を判定し、`timestamp` のない項目は収集しない。GitHubのイベントAPIは直近300件までしか返さないため、対象期間に300件を超える活動があると期間の前半のイベントを収集できない。この場合は警告ログを出す。
+通常実行では、`config.toml` の設定に基づき実行前日までの 7 日間を収集して記事を生成する。
 
 ```bash
 uv run python digest.py
-uv run python digest.py --target-week 2026-W36
-uv run python digest.py --target-week current
-uv run python digest.py --from 2026-08-01 --to 2026-08-10
 ```
 
-WordPressへ下書きを送る場合は `--publish` を加える。
+WordPress へ保存する場合は `--publish` を指定する（既定では下書きとして保存）。
 
 ```bash
 uv run python digest.py --publish
 ```
 
-## GitHub Actions
+### 収集期間の指定
 
-[.github/workflows/digest.yml](.github/workflows/digest.yml) は毎週月曜9時（日本時間）に実行し、WordPressへ下書きを保存する。手動実行では対象週と送信の有無を選べる。Repository Secretsへ次を登録する。
+CLI 引数により収集期間を上書きできる。優先順位は次のとおりである。
+
+1. `--from` と `--to`（特定の日付範囲を指定。両方を必ず同時に指定すること）
+1. `--target-week`（週単位で指定。例: `2026-W36` や `current`）
+1. `config.toml` の `[period]` 設定
+
+```bash
+# 週を指定して実行
+uv run python digest.py --target-week 2026-W36
+
+# 今週（実行日を含む週）を指定して実行
+uv run python digest.py --target-week current
+
+# 日付範囲を指定して実行
+uv run python digest.py --from 2026-08-01 --to 2026-08-10
+```
+
+> [!NOTE]
+> 対象期間内に活動イベントが存在しない場合、AI モデルの呼び出しや記事生成は行わずに終了する。
+
+## 定期実行（GitHub Actions）
+
+[.github/workflows/digest.yml](.github/workflows/digest.yml) により、毎週月曜 9:00（JST）に自動実行し、WordPress へ下書きを保存する。GitHub の Actions タブから手動実行（workflow_dispatch）も可能である。
+
+### Repository Secrets の設定
+
+GitHub リポジトリの Secrets に次の項目を登録する。
 
 - `DIGEST_CONFIG_TOML`: `config.toml` の内容全体
 - `GEMINI_API_KEY`
@@ -87,17 +107,17 @@ uv run python digest.py --publish
 - `WORDPRESS_USERNAME`
 - `WORDPRESS_APP_PASSWORD`
 
-publicリポジトリでは、実行ログとアーティファクトを第三者が閲覧できる。そのため、確認前の記事はWordPressの下書きにのみ保存し、アーティファクトにはアップロードしない。Actions上で失敗した場合は、ログに失敗した段階と例外の型名のみを出力する。例外メッセージやスタックトレースを含む詳細は、ローカル実行時にのみ出力する。
+### 60 日間非アクティブ時の再有効化
 
-publicリポジトリでは、60日間活動がないとGitHubが定期実行を無効化する。定期実行自体は活動に含まれない。無効化のおよそ7日前に、ワークフローの作成者へ警告メールが届く。作成後に別の人がcronを変更した場合や、無効化後に再有効化した場合は、その人へ届く。有効なワークフローへAPIで再有効化を繰り返して延命する方法は公式に保証されておらず、この方法を提供していたActionはGitHubの利用規約違反で凍結された。そのため、自動で延命する仕組みは置かず、このメールで停止を検知する。無効化された場合は、Actionsタブの対象ワークフローで再有効化するか、次のコマンドを実行する。
+GitHub の仕様により、public リポジトリで 60 日間コミットなどの活動がない場合、スケジュール実行（cron）が自動的に無効化される。無効化された場合は、Actions タブから再有効化するか、GitHub CLI で次のコマンドを実行する。
 
 ```bash
 gh workflow enable digest.yml
 ```
 
-## 品質検査
+## 開発と品質検査
 
-`project-standards` の一般層とPython層に合わせ、pre-commit、Ruff、Pyright、pytestを使用する。初回だけフックを設定する。
+`project-standards` の一般層と Python 層に合わせ、pre-commit、Ruff、Pyright、pytest を使用する。初回セットアップ時にフックを設定する。
 
 ```bash
 bash scripts/setup.sh
@@ -105,6 +125,8 @@ uv run pre-commit run --all-files
 uv run pre-commit run --all-files --hook-stage pre-push
 ```
 
-Pull Requestでは [.github/workflows/ci.yml](.github/workflows/ci.yml) が共有のPython CIを呼ぶ。
+Pull Request では [.github/workflows/ci.yml](.github/workflows/ci.yml) が共有の Python CI を呼ぶ。
 
-詳しい責務とデータ境界は [docs/concept.md](docs/concept.md) に記載する。
+## 関連ドキュメント
+
+システムの設計方針、アーキテクチャ、データ境界、コンポーネント責務の詳細は [docs/concept.md](docs/concept.md) を参照のこと。
