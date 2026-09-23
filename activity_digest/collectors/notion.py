@@ -8,7 +8,7 @@ from activity_digest.collectors import SourceDocument
 
 NOTION_CONTEXT = """このソースは、本人が Notion の許可されたデータベースへ対象期間内に作成したページの一覧である。
 メモ、作業記録、後で読むために保存した記事などが混在する。
-URL を持つページは保存した情報であり、本人がその内容を実施したことを意味しない。"""
+URL を持つページは保存した情報である場合があり、実施した活動とは限らない。"""
 
 
 def collect(

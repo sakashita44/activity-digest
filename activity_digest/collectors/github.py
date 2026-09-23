@@ -10,7 +10,7 @@ from activity_digest.collectors import SourceDocument
 
 GITHUB_CONTEXT = """このソースは、本人の GitHub アカウントで発生した操作の履歴である。
 リポジトリごとに、対象期間内の操作を日付と種類ごとの件数で並べている。
-ここにある操作は、本人が実際に行った開発活動として扱う。"""
+操作には閲覧やスターなど作業を伴わないものも含まれるため、開発活動を推測する手がかりとして扱う。"""
 GITHUB_EVENTS_PER_PAGE = 100
 # GitHub の events API は直近300件までしか返さず、それ以降のページは 422 になる
 GITHUB_EVENTS_MAX_PAGES = 3
