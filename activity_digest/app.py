@@ -4,6 +4,8 @@ import os
 import re
 import sys
 import tomllib
+from collections.abc import Generator
+from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -41,6 +43,23 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger("activity-digest")
+# httpx は INFO でリクエスト URL を記録し、非公開リポジトリ名やデータソース ID が公開ログに残るため抑止する
+for _noisy_logger in ("httpx", "httpcore"):
+    logging.getLogger(_noisy_logger).setLevel(logging.WARNING)
+
+
+class PipelineStageError(Exception):
+    def __init__(self, stage: str) -> None:
+        super().__init__(stage)
+        self.stage = stage
+
+
+@contextmanager
+def pipeline_stage(stage: str) -> Generator[None]:
+    try:
+        yield
+    except Exception as error:
+        raise PipelineStageError(stage) from error
 
 
 def load_env(env_path: Path | None = None) -> None:
@@ -237,86 +256,108 @@ def run_pipeline(
     genai_client: Any | None = None,
     http_client: httpx.Client | None = None,
 ) -> str | None:
-    load_env()
-    config = load_config(config_path)
-    try:
-        timezone = ZoneInfo(str(config.get("timezone", "Asia/Tokyo")))
-    except ZoneInfoNotFoundError:
-        logger.warning("未知のタイムゾーン。Asia/Tokyo を使用する")
-        timezone = TOKYO_TZ
+    with pipeline_stage("setup"):
+        load_env()
+        config = load_config(config_path)
+        try:
+            timezone = ZoneInfo(str(config.get("timezone", "Asia/Tokyo")))
+        except ZoneInfoNotFoundError:
+            logger.warning("未知のタイムゾーン。Asia/Tokyo を使用する")
+            timezone = TOKYO_TZ
 
-    start_dt, end_dt, slug_suffix = get_target_range(
-        config, target_week, from_date, to_date, ref_date, timezone
-    )
-    wordpress_config = config.get("wordpress", {})
-    weekly_slug = (
-        f"{wordpress_config.get('slug_prefix', 'activity-digest')}-{slug_suffix}"
-    )
-    local_files = list(config.get("local_files", []))
-    if local_events_path:
-        local_files.append(local_events_path)
+        start_dt, end_dt, slug_suffix = get_target_range(
+            config, target_week, from_date, to_date, ref_date, timezone
+        )
+        wordpress_config = config.get("wordpress", {})
+        weekly_slug = (
+            f"{wordpress_config.get('slug_prefix', 'activity-digest')}-{slug_suffix}"
+        )
+        local_files = list(config.get("local_files", []))
+        if local_events_path:
+            local_files.append(local_events_path)
 
-    events = (
-        collect_github_events(config, start_dt, end_dt, client=http_client)
-        + collect_notion_events(config, start_dt, end_dt, client=http_client)
-        + load_local_events(local_files, start_dt, end_dt, tz=timezone)
-    )
-    sanitized = sanitize_and_order_events(events, config)
-    if not sanitized:
-        logger.info("No activity records found for %s. Skipping.", slug_suffix)
-        return None
+    with pipeline_stage("collect"):
+        events = (
+            collect_github_events(config, start_dt, end_dt, client=http_client)
+            + collect_notion_events(config, start_dt, end_dt, client=http_client)
+            + load_local_events(local_files, start_dt, end_dt, tz=timezone)
+        )
+        sanitized = sanitize_and_order_events(events, config)
+        if not sanitized:
+            logger.info("No activity records found for %s. Skipping.", slug_suffix)
+            return None
+        ensure_no_coordinates(sanitized)
+    logger.info("Collected %d events", len(sanitized))
 
-    ensure_no_coordinates(sanitized)
-    ai_client = genai_client or genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
     prompt_config = config.get("prompts", {})
-    approved = run_stage1_inspector(
-        ai_client,
-        resolve_model(config, "stage1_model"),
-        sanitized,
-        prompt_path=prompt_config.get("inspector", "prompts/inspector.md"),
-    )
+    with pipeline_stage("stage1-inspector"):
+        ai_client = genai_client or genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        approved = run_stage1_inspector(
+            ai_client,
+            resolve_model(config, "stage1_model"),
+            sanitized,
+            prompt_path=prompt_config.get("inspector", "prompts/inspector.md"),
+        )
     if not approved:
+        logger.info("Stage 1 approved no events. Skipping.")
         return None
-    draft = run_stage2_writer(
-        ai_client,
-        resolve_model(config, "stage2_model"),
-        approved,
-        slug_suffix,
-        prompt_path=prompt_config.get("writer", "prompts/writer.md"),
-    )
-    final_draft = run_stage3_editor(
-        ai_client,
-        resolve_model(config, "stage3_model"),
-        draft,
-        prompt_path=prompt_config.get("editor", "prompts/editor.md"),
-    )
+    with pipeline_stage("stage2-writer"):
+        draft = run_stage2_writer(
+            ai_client,
+            resolve_model(config, "stage2_model"),
+            approved,
+            slug_suffix,
+            prompt_path=prompt_config.get("writer", "prompts/writer.md"),
+        )
+    with pipeline_stage("stage3-editor"):
+        final_draft = run_stage3_editor(
+            ai_client,
+            resolve_model(config, "stage3_model"),
+            draft,
+            prompt_path=prompt_config.get("editor", "prompts/editor.md"),
+        )
     disclosure = str(config.get("disclosure", FIXED_DISCLOSURE))
     final_markdown = format_article_markdown(final_draft, disclosure)
 
-    output_path = Path(
-        output_override
-        or (Path(config.get("output_dir", "artifacts")) / f"{weekly_slug}.md")
-    )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(final_markdown, encoding="utf-8")
+    with pipeline_stage("write-output"):
+        output_path = Path(
+            output_override
+            or (Path(config.get("output_dir", "artifacts")) / f"{weekly_slug}.md")
+        )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(final_markdown, encoding="utf-8")
 
     if publish:
-        wp_url = os.getenv("WORDPRESS_URL")
-        wp_user = os.getenv("WORDPRESS_USERNAME")
-        wp_password = os.getenv("WORDPRESS_APP_PASSWORD")
-        if not (wp_url and wp_user and wp_password):
-            raise ValueError("WordPress credentials not configured")
-        publish_wordpress_draft(
-            wp_url,
-            wp_user,
-            wp_password,
-            weekly_slug,
-            str(final_draft.get("title", "")),
-            format_article_body(final_draft, disclosure),
-            wordpress_config.get("post_defaults", {}),
-            client=http_client,
-        )
+        with pipeline_stage("publish"):
+            wp_url = os.getenv("WORDPRESS_URL")
+            wp_user = os.getenv("WORDPRESS_USERNAME")
+            wp_password = os.getenv("WORDPRESS_APP_PASSWORD")
+            if not (wp_url and wp_user and wp_password):
+                raise ValueError("WordPress credentials not configured")
+            publish_wordpress_draft(
+                wp_url,
+                wp_user,
+                wp_password,
+                weekly_slug,
+                str(final_draft.get("title", "")),
+                format_article_body(final_draft, disclosure),
+                wordpress_config.get("post_defaults", {}),
+                client=http_client,
+            )
+        logger.info("WordPress draft saved")
     return final_markdown
+
+
+def report_failure(error: Exception, detailed: bool) -> None:
+    stage = error.stage if isinstance(error, PipelineStageError) else "unknown"
+    cause = error.__cause__ if isinstance(error, PipelineStageError) else error
+    if detailed:
+        logger.error("Pipeline failed at %s", stage, exc_info=cause)
+        return
+    # 公開される Actions のログには API の応答本文や活動内容を含み得る例外メッセージを出さない
+    logger.error(
+        "Pipeline failed at %s: %s", stage, type(cause).__name__ if cause else "-"
+    )
 
 
 def main() -> None:
@@ -340,7 +381,7 @@ def main() -> None:
             args.to_date,
         )
     except Exception as error:
-        logger.error("Pipeline failed: %s", error)
+        report_failure(error, detailed=os.getenv("GITHUB_ACTIONS") != "true")
         sys.exit(1)
 
 

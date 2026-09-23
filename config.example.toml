@@ -38,8 +38,8 @@ blacklist = ["octocat/secret-notes", "octocat/private-tools"]
 [notion]
 # 収集を許可するデータソースだけを列挙する
 data_source_ids = [
-    "d9b4b0e1-6284-406e-8215-21d1e43c68a4",
-    "f1a2b3c4-d5e6-47f8-a9b0-c1d2e3f4a5b6",
+    "00000000-0000-0000-0000-000000000001",
+    "00000000-0000-0000-0000-000000000002",
 ]
 
 [wordpress]
