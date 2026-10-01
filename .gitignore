@@ -1,7 +1,7 @@
 ﻿.env
 .env.*
 !.env.example
-config.toml
+/config/
 artifacts/
 tmp/
 __pycache__/

@@ -23,7 +23,7 @@ from activity_digest.ai import (
 from activity_digest.collectors import SourceDocument, github, notion
 
 TOKYO_TZ = ZoneInfo("Asia/Tokyo")
-FIXED_DISCLOSURE = "※ この記事はAIによって自動生成されており、事実と異なる内容を含む可能性があります。公開は人間が内容を確認したうえで行います。"
+CONTENT_PLACEHOLDER = "{{ content }}"
 WORDPRESS_DEFAULT_FIELDS = {
     "categories",
     "tags",
@@ -67,12 +67,23 @@ def load_env(env_path: Path | None = None) -> None:
             os.environ.setdefault(key.strip(), value.strip().strip("'\""))
 
 
-def load_config(config_path: str | Path = "config.toml") -> dict[str, Any]:
-    path = Path(config_path)
+def _load_toml(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise FileNotFoundError(f"設定ファイルが見つからない: {path}")
     with path.open("rb") as config_file:
         return tomllib.load(config_file)
+
+
+def load_config(config_dir: str | Path = "config") -> dict[str, Any]:
+    directory = Path(config_dir)
+    config = _load_toml(directory / "global.toml")
+    for path in sorted((directory / "sources").glob("*.toml")):
+        if path.stem in config:
+            raise ValueError(
+                f"ソース設定 {path.name} の名前が Global 設定のキーと重複する"
+            )
+        config[path.stem] = _load_toml(path)
+    return config
 
 
 def _range_result(
@@ -131,12 +142,14 @@ def get_target_range(
         return _range_result(monday, monday + timedelta(days=6), zone)
 
     period = config.get("period", {})
-    days = int(period.get("days", 7))
-    end_offset_days = int(period.get("end_offset_days", 1))
-    if days < 1 or end_offset_days < 0:
-        raise ValueError("period.days は1以上、end_offset_days は0以上で指定する")
-    end_day = now.date() - timedelta(days=end_offset_days)
-    return _range_result(end_day - timedelta(days=days - 1), end_day, zone)
+    window_days = int(period.get("window_days", 7))
+    delay_days = int(period.get("delay_days", 0))
+    if window_days < 1 or delay_days < 0:
+        raise ValueError(
+            "period.window_days は1以上、period.delay_days は0以上で指定する"
+        )
+    end_day = now.date() - timedelta(days=delay_days + 1)
+    return _range_result(end_day - timedelta(days=window_days - 1), end_day, zone)
 
 
 def get_target_week_range(
@@ -163,16 +176,23 @@ def format_article_title(start_dt: datetime, end_dt: datetime) -> str:
     return f"{start_dt:%Y-%m-%d}〜{end_dt:%Y-%m-%d}の活動記録"
 
 
-def format_article_markdown(
-    title: str, content: str, disclosure: str = FIXED_DISCLOSURE
-) -> str:
-    return f"# {title}\n\n" + format_article_body(content, disclosure)
+def load_article_template(template_path: str | Path) -> str:
+    path = Path(template_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"記事テンプレートが見つからない: {path}")
+    template = path.read_text(encoding="utf-8")
+    if CONTENT_PLACEHOLDER not in template:
+        raise ValueError(f"記事テンプレートに {CONTENT_PLACEHOLDER} がない: {path}")
+    return template
 
 
-def format_article_body(content: str, disclosure: str = FIXED_DISCLOSURE) -> str:
-    # WordPress はタイトルを別フィールドで表示するため、本文にはタイトル見出しを含めない
-    required_disclosure = disclosure.strip() or FIXED_DISCLOSURE
-    return f"{content.strip()}\n\n---\n\n{required_disclosure}\n"
+def render_article_body(template: str, content: str) -> str:
+    return template.replace(CONTENT_PLACEHOLDER, content.strip())
+
+
+def format_article_markdown(title: str, body: str) -> str:
+    # WordPress はタイトルを別フィールドで表示するため、タイトル見出しはローカル出力にだけ付ける
+    return f"# {title}\n\n{body}"
 
 
 def publish_wordpress_draft(
@@ -238,7 +258,7 @@ def dump_intermediate(dump_dir: str | None, name: str, text: str) -> None:
 
 
 def run_pipeline(
-    config_path: str = "config.toml",
+    config_dir: str = "config",
     target_week: str | None = None,
     publish: bool = False,
     output_override: str | None = None,
@@ -251,7 +271,7 @@ def run_pipeline(
 ) -> str | None:
     with pipeline_stage("setup"):
         load_env()
-        config = load_config(config_path)
+        config = load_config(config_dir)
         try:
             timezone = ZoneInfo(str(config.get("timezone", "Asia/Tokyo")))
         except ZoneInfoNotFoundError:
@@ -266,6 +286,9 @@ def run_pipeline(
             f"{wordpress_config.get('slug_prefix', 'activity-digest')}-{slug_suffix}"
         )
         title = format_article_title(start_dt, end_dt)
+        article_template = load_article_template(
+            config.get("article", {}).get("template", "templates/article.md")
+        )
 
     with pipeline_stage("collect"):
         documents: list[SourceDocument] = []
@@ -319,8 +342,8 @@ def run_pipeline(
         )
     dump_intermediate(dump_dir, "stage3.md", content)
     logger.info("Stage 3 completed")
-    disclosure = str(config.get("disclosure", FIXED_DISCLOSURE))
-    final_markdown = format_article_markdown(title, content, disclosure)
+    body = render_article_body(article_template, content)
+    final_markdown = format_article_markdown(title, body)
 
     with pipeline_stage("write-output"):
         output_path = Path(
@@ -343,7 +366,7 @@ def run_pipeline(
                 wp_password,
                 weekly_slug,
                 title,
-                format_article_body(content, disclosure),
+                body,
                 wordpress_config.get("post_defaults", {}),
                 client=http_client,
             )
@@ -365,7 +388,11 @@ def report_failure(error: Exception, detailed: bool) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Activity Digest Pipeline")
-    parser.add_argument("--config", default="config.toml")
+    parser.add_argument(
+        "--config-dir",
+        default="config",
+        help="global.toml と sources/*.toml を置くディレクトリ",
+    )
     parser.add_argument("--target-week", default=None)
     parser.add_argument("--from", dest="from_date", default=None)
     parser.add_argument("--to", dest="to_date", default=None)
@@ -379,7 +406,7 @@ def main() -> None:
     args = parser.parse_args()
     try:
         run_pipeline(
-            args.config,
+            args.config_dir,
             args.target_week,
             args.publish,
             args.output,

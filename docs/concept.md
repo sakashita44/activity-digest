@@ -22,7 +22,15 @@
 
 ### 必須開示文の付与
 
-AIによって生成された記録であること、事実と異なる内容を含む可能性、人間が確認したうえで公開する前提を示す開示文を、コードが最終出力の末尾へ結合する。文面は設定できるが、空にはできない。記事タイトルも対象期間からコードが生成し、AIは本文だけを生成する。
+AIによって生成された記録であること、事実と異なる内容を含む可能性、人間が確認したうえで公開する前提を示す開示文は、記事テンプレートの固定部分としてGit管理する。AIは本文だけを生成し、コードがテンプレートの `{{ content }}` へ差し込む。記事タイトルも対象期間からコードが生成する。テンプレートに `{{ content }}` がなければ、AIを呼ぶ前に処理を失敗させる。
+
+### 対象期間の公開遅延
+
+直近の予定や位置などをすぐ記事にしないため、対象期間の末尾を実行日から設定日数だけさかのぼらせられる。これは補助的な安全策であり、公開前に人が確認する前提は変わらない。CLI で期間を明示した場合は、利用者の意図を優先して公開遅延を適用しない。
+
+### 設定と認証情報の分離
+
+設定は、全体の動作を決める Global 設定と、サービスごとの収集対象を決めるソース設定に分ける。実際の設定には非公開リポジトリ名やデータソース ID が含まれるためGit管理せず、Actions では Repository Secrets から実行時に復元する。設定は「何を読み、どう動くか」、認証情報は「どう認証するか」を表し、Actions ではそれぞれ別の Secret で管理する。
 
 ### 下書き連携と同一期間の更新
 
@@ -42,7 +50,7 @@ flowchart LR
         Stage1[Stage 1: 情報検査]
         Stage2[Stage 2: 記事草案]
         Stage3[Stage 3: 日本語推敲]
-        Assemble[タイトル・開示文の付与]
+        Assemble[テンプレートへの差し込み・タイトルの付与]
     end
 
     subgraph Destination [出力先]
@@ -67,23 +75,23 @@ flowchart LR
 - Stage 1（情報検査）: [prompts/inspector.md](../prompts/inspector.md) に基づき、Source document から公開してよい材料を Markdown の箇条書きで出力する。公開してよい材料がなければ空を返し、パイプラインは記事を作らずに終了する。
 - Stage 2（記事草案）: [prompts/writer.md](../prompts/writer.md) に基づき、材料から活動を並べた草案を作る。
 - Stage 3（日本語推敲）: [prompts/editor.md](../prompts/editor.md) に基づき、草案を常体の自然な日本語に推敲し、記事本文だけを出力する。
-- タイトル・開示文の付与: 対象期間から生成したタイトルと、設定の開示文を記事本文に結合する。
+- テンプレートへの差し込み・タイトルの付与: 記事本文を記事テンプレートの `{{ content }}` へ差し込み、対象期間から生成したタイトルを付ける。
 - 出力先: 記事をローカルファイルへ書き出し、指定時は WordPress へ下書き保存する。
 
 ## データフロー
 
 1. 週次スケジュールまたは手動実行で起動する。
-1. 設定されたタイムゾーンと日数・終了日のオフセット、または CLI の明示範囲から対象期間を決める。
+1. Global 設定とソース設定を読み込む。設定されたタイムゾーン、収集日数、公開遅延、または CLI の明示範囲から対象期間を決める。
 1. 各 Collector が Source document を生成する。すべての Collector が何も返さなければ終了する。
 1. Stage 1 がすべての Source document を受け取り、公開してよい材料を出力する。材料が空なら終了する。
 1. Stage 2 が記事草案を、Stage 3 が記事本文を生成する。
-1. タイトルと開示文を結合し、ローカル Markdown ファイルへ書き出す。指定時は WordPress へ下書き登録する。
+1. 記事本文を記事テンプレートへ差し込んでタイトルを付け、ローカル Markdown ファイルへ書き出す。指定時は WordPress へ下書き保存する。
 
 ## 実装構成
 
 - CLI ラッパー: `digest.py` がコマンドライン引数を受け付け、パイプラインを起動する。
 - Collector: `activity_digest/collectors/` にサービスごとのモジュールを置く。Source document の型は `activity_digest/collectors/__init__.py` に定める。
 - 生成エンジン: `activity_digest/ai.py` が google-genai SDK 経由で3回のリクエストを実行する。プロンプトは `prompts/` 配下のファイルからテンプレート変数を置換して作る。
-- パイプライン統括・パブリッシュ: `activity_digest/app.py` が TOML 設定の読み込み、期間計算、記事の組み立て、WordPress REST API（Application Passwords 認証、status=draft 固定）への連携を担う。
+- パイプライン統括・パブリッシュ: `activity_digest/app.py` が `config/` 配下の TOML 設定の読み込み、対象期間の計算、`templates/article.md` による記事の組み立て、および WordPress REST API（Application Passwords 認証、status=draft 固定）への連携を担う。
 - パッケージ・環境管理: uv による非パッケージプロジェクト管理（pyproject.toml、uv.lock、.python-version）。
 - 実行基盤: GitHub Actions による共有品質検査と週次実行。

@@ -18,13 +18,13 @@ from activity_digest.ai import (
     strip_code_fence,
 )
 from activity_digest.app import (
-    FIXED_DISCLOSURE,
     PipelineStageError,
-    format_article_markdown,
     format_article_title,
     get_target_range,
+    load_article_template,
     load_config,
     publish_wordpress_draft,
+    render_article_body,
     report_failure,
     resolve_model,
     run_pipeline,
@@ -36,24 +36,19 @@ PERIOD_START = datetime(2026, 9, 1, tzinfo=TOKYO_TZ)
 PERIOD_END = datetime(2026, 9, 7, 23, 59, tzinfo=TOKYO_TZ)
 
 
-def config_text(output_dir: str = "artifacts") -> str:
-    return f'''timezone = "Asia/Tokyo"
+def write_config(config_dir: Path, output_dir: str = "artifacts") -> str:
+    sources = config_dir / "sources"
+    sources.mkdir(parents=True)
+    (config_dir / "global.toml").write_text(
+        f'''timezone = "Asia/Tokyo"
 output_dir = "{output_dir.replace("\\", "/")}"
-disclosure = ""
 
 [period]
-days = 7
-end_offset_days = 1
+window_days = 7
+delay_days = 0
 
 [gemini]
 model = "gemini-3.7-flash"
-
-[github]
-username = "tester"
-blacklist = ["secret-org/private-repo", "my-org/core-secret"]
-
-[notion]
-data_source_ids = ["ds-1", "ds-2"]
 
 [wordpress]
 slug_prefix = "activity-digest"
@@ -61,7 +56,18 @@ slug_prefix = "activity-digest"
 [wordpress.post_defaults]
 categories = [3]
 comment_status = "closed"
-'''
+''',
+        encoding="utf-8",
+    )
+    (sources / "github.toml").write_text(
+        'username = "tester"\n'
+        'blacklist = ["secret-org/private-repo", "my-org/core-secret"]\n',
+        encoding="utf-8",
+    )
+    (sources / "notion.toml").write_text(
+        'data_source_ids = ["ds-1", "ds-2"]\n', encoding="utf-8"
+    )
+    return str(config_dir)
 
 
 def github_event(event_id: str, repo: str, created_at: str) -> dict[str, object]:
@@ -89,7 +95,7 @@ class TestDigestPipeline(unittest.TestCase):
     def setUp(self) -> None:
         self.config = {
             "timezone": "Asia/Tokyo",
-            "period": {"days": 7, "end_offset_days": 1},
+            "period": {"window_days": 7, "delay_days": 0},
             "gemini": {"model": "gemini-3.7-flash"},
             "github": {
                 "username": "tester",
@@ -99,12 +105,48 @@ class TestDigestPipeline(unittest.TestCase):
             "wordpress": {"slug_prefix": "activity-digest"},
         }
 
-    def test_toml_config_and_period_ranges(self) -> None:
+    def test_global_and_source_configs_are_merged_by_file_name(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "config.toml"
-            path.write_text(config_text(), encoding="utf-8")
-            self.assertEqual(load_config(path)["period"]["days"], 7)
+            config = load_config(write_config(Path(directory) / "config"))
+            self.assertEqual(config["period"]["window_days"], 7)
+            self.assertEqual(config["github"]["username"], "tester")
+            self.assertEqual(config["notion"]["data_source_ids"], ["ds-1", "ds-2"])
 
+            (Path(directory) / "config" / "sources" / "period.toml").write_text(
+                "window_days = 1\n", encoding="utf-8"
+            )
+            with self.assertRaises(ValueError):
+                load_config(Path(directory) / "config")
+
+    def test_delay_days_shifts_period_back(self) -> None:
+        reference = datetime(2026, 9, 14, 12, tzinfo=TOKYO_TZ)
+        start, end, suffix = get_target_range(
+            {"period": {"window_days": 7, "delay_days": 7}}, ref_date=reference
+        )
+        self.assertEqual(
+            (start.date().isoformat(), end.date().isoformat(), suffix),
+            ("2026-08-31", "2026-09-06", "2026-w36"),
+        )
+        start, end, _ = get_target_range(
+            {"period": {"window_days": 3, "delay_days": 2}}, ref_date=reference
+        )
+        self.assertEqual(
+            (start.date().isoformat(), end.date().isoformat()),
+            ("2026-09-09", "2026-09-11"),
+        )
+        with self.assertRaises(ValueError):
+            get_target_range({"period": {"delay_days": -1}}, ref_date=reference)
+
+        # 明示した週と日付範囲には遅延を適用しない
+        delayed = {"period": {"window_days": 7, "delay_days": 7}}
+        _, _, suffix = get_target_range(delayed, "last", ref_date=reference)
+        self.assertEqual(suffix, "2026-w37")
+        _, _, suffix = get_target_range(
+            delayed, from_date="2026-09-12", to_date="2026-09-13", ref_date=reference
+        )
+        self.assertEqual(suffix, "20260912-20260913")
+
+    def test_period_ranges(self) -> None:
         reference = datetime(2026, 9, 7, 12, tzinfo=TOKYO_TZ)
         start, end, suffix = get_target_range(self.config, ref_date=reference)
         self.assertEqual(start.date().isoformat(), "2026-08-31")
@@ -223,10 +265,7 @@ class TestDigestPipeline(unittest.TestCase):
     def test_pipeline_runs_three_stages_and_writes_template_parts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            config_path = root / "config.toml"
-            config_path.write_text(
-                config_text(str(root / "artifacts")), encoding="utf-8"
-            )
+            config_dir = write_config(root / "config", str(root / "artifacts"))
             events = [
                 github_event("10", "my-org/public-project", "2026-09-02T10:00:00Z")
             ]
@@ -243,17 +282,18 @@ class TestDigestPipeline(unittest.TestCase):
             ai_client = ai_responses("- 開発した", "## 開発\n\n草案", "## 開発\n\n本文")
 
             result = run_pipeline(
-                config_path=str(config_path),
+                config_dir=config_dir,
                 target_week="2026-W36",
                 dump_dir=str(root / "dump"),
                 genai_client=ai_client,
                 http_client=http_client,
             )
             self.assertEqual(ai_client.models.generate_content.call_count, 3)
+            template = Path("templates/article.md").read_text(encoding="utf-8")
             self.assertEqual(
                 result,
-                "# 2026-08-31〜2026-09-06の活動記録\n\n## 開発\n\n本文\n\n---\n\n"
-                f"{FIXED_DISCLOSURE}\n",
+                "# 2026-08-31〜2026-09-06の活動記録\n\n"
+                + template.replace("{{ content }}", "## 開発\n\n本文"),
             )
             self.assertTrue(
                 (root / "artifacts" / "activity-digest-2026-w36.md").is_file()
@@ -269,10 +309,9 @@ class TestDigestPipeline(unittest.TestCase):
         )
         ai_client = MagicMock()
         with tempfile.TemporaryDirectory() as directory:
-            config_path = Path(directory) / "config.toml"
-            config_path.write_text(config_text(), encoding="utf-8")
+            config_dir = write_config(Path(directory) / "config")
             result = run_pipeline(
-                str(config_path), "2026-W36", genai_client=ai_client, http_client=client
+                config_dir, "2026-W36", genai_client=ai_client, http_client=client
             )
         self.assertIsNone(result)
         ai_client.models.generate_content.assert_not_called()
@@ -284,10 +323,9 @@ class TestDigestPipeline(unittest.TestCase):
         )
         ai_client = ai_responses("")
         with tempfile.TemporaryDirectory() as directory:
-            config_path = Path(directory) / "config.toml"
-            config_path.write_text(config_text(directory), encoding="utf-8")
+            config_dir = write_config(Path(directory) / "config", directory)
             result = run_pipeline(
-                str(config_path), "2026-W36", genai_client=ai_client, http_client=client
+                config_dir, "2026-W36", genai_client=ai_client, http_client=client
             )
         self.assertIsNone(result)
         self.assertEqual(ai_client.models.generate_content.call_count, 1)
@@ -346,7 +384,19 @@ class TestDigestPipeline(unittest.TestCase):
             )
         self.assertEqual(posted, [])
 
-    def test_prompt_model_and_disclosure_configuration(self) -> None:
+    def test_article_template_wraps_generated_content(self) -> None:
+        self.assertEqual(
+            render_article_body("{{ content }}\n\n---\n\n固定文\n", "\n本文\n"),
+            "本文\n\n---\n\n固定文\n",
+        )
+        self.assertIn("{{ content }}", load_article_template("templates/article.md"))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "article.md"
+            path.write_text("開示文だけ\n", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                load_article_template(path)
+
+    def test_prompt_and_model_configuration(self) -> None:
         rendered = render_prompt(
             "{{period}} {{material}}", {"period": "P", "material": "M"}
         )
@@ -354,7 +404,6 @@ class TestDigestPipeline(unittest.TestCase):
         config = {"gemini": {"model": "global", "stage1_model": "inspector"}}
         self.assertEqual(resolve_model(config, "stage1_model"), "inspector")
         self.assertEqual(resolve_model(config, "stage2_model"), "global")
-        self.assertIn(FIXED_DISCLOSURE, format_article_markdown("T", "本文", ""))
 
     def test_http_request_urls_are_not_logged(self) -> None:
         handler = BufferingHandler(capacity=1000)
@@ -382,14 +431,13 @@ class TestDigestPipeline(unittest.TestCase):
             )
         )
         with tempfile.TemporaryDirectory() as directory:
-            config_path = Path(directory) / "config.toml"
-            config_path.write_text(config_text(), encoding="utf-8")
+            config_dir = write_config(Path(directory) / "config")
             with (
                 patch.dict(os.environ, {"GH_ACTIVITY_TOKEN": "token"}),
                 self.assertRaises(PipelineStageError) as raised,
             ):
                 run_pipeline(
-                    str(config_path),
+                    config_dir,
                     "2026-W36",
                     genai_client=MagicMock(),
                     http_client=client,

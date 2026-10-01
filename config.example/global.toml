@@ -1,0 +1,39 @@
+# 日付境界と収集結果の表示に使うタイムゾーン
+timezone = "Asia/Tokyo"
+
+# 生成した Markdown の保存先
+output_dir = "artifacts"
+
+[period]
+# 実行日の前日を起点に delay_days 日さかのぼった日を末尾とし、window_days 日分を集める
+# 直近の活動をすぐ記事にしないよう、この例では実行日の前日から 7 日分を対象外にする
+window_days = 7
+delay_days = 7
+
+[article]
+# {{ content }} を AI が生成した本文に置き換える。開示文などの固定部分はテンプレートに書く
+template = "templates/article.md"
+
+[gemini]
+# 段階別モデルを省略した場合に使うモデル
+model = "gemini-3.7-flash"
+# stage1_model = "gemini-3.7-flash"
+# stage2_model = "gemini-3.7-flash"
+# stage3_model = "gemini-3.7-flash"
+
+[prompts]
+inspector = "prompts/inspector.md"
+writer = "prompts/writer.md"
+editor = "prompts/editor.md"
+
+[wordpress]
+slug_prefix = "activity-digest"
+
+[wordpress.post_defaults]
+# WordPress REST API の ID。不要な項目は削除できる
+categories = [1]
+tags = []
+# author = 1
+comment_status = "closed"
+ping_status = "closed"
+format = "standard"

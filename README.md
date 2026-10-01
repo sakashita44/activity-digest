@@ -6,7 +6,7 @@ GitHubとNotionに残る活動の痕跡を集め、Geminiで週次の活動記�
 
 1. サービスごとのCollectorが、対象期間の記録をSource documentとして生成する。Source documentは、ソース名、その記録が何を意味するかをAIへ伝える前提（context）、記録の一覧からなるMarkdownである。GitHubの対象リポジトリの絞り込みとNotionのデータソースの許可は、Collectorがコードで適用する。
 1. Geminiを独立したコンテキストで3回呼ぶ。情報検査では各ソースの前提に沿って記録を解釈し、個人名や秘密情報を除いた材料を作る。続いて記事草案の執筆、文体の推敲を順に行う。
-1. 対象期間から生成したタイトルと開示文を推敲後の本文に付け、Markdownへ保存する。
+1. 推敲後の本文を記事テンプレートへ差し込み、対象期間から生成したタイトルを付けてMarkdownへ保存する。開示文は記事テンプレートの固定部分に含め、AIには生成させない。
 1. 指定時だけWordPress REST APIへ下書きとして登録する。同じスラッグの下書きがあれば更新する。同じスラッグの投稿が公開済みなど下書き以外の状態なら、人が確認・編集した記事を守るため更新せずエラーで終了する。
 
 対象期間に活動がなければGeminiを呼ばず、記事も作らない。
@@ -17,11 +17,11 @@ Python 3.12と[uv](https://docs.astral.sh/uv/)を使用する。
 
 ```bash
 uv sync --dev
-cp config.example.toml config.toml
+cp -r config.example config
 cp .env.example .env
 ```
 
-`config.toml` と `.env` はGit管理の対象外である。認証情報は `.env` または実行環境へ設定する。
+`config/` と `.env` はGitで管理しない。認証情報は `.env` または実行環境へ設定する。
 
 - `GEMINI_API_KEY`: Google AI APIキー
 - `GH_ACTIVITY_TOKEN`: GitHubトークン。未設定時は `GITHUB_TOKEN` を使う
@@ -33,30 +33,39 @@ cp .env.example .env
 
 ## 設定できる範囲
 
-コメント付きの [config.example.toml](config.example.toml) を複製して設定する。
+コメント付きの [config.example/](config.example/) を `config/` へ複製して設定する。設定は、全体の動作を決めるGlobal設定と、サービスごとの収集対象を決めるソース設定に分かれる。
 
-- 基本設定: タイムゾーン、出力先、開示文
-- 収集期間: `period.days` と `period.end_offset_days`
-- Gemini: 共通モデル、3段階それぞれのモデル、各プロンプトのファイルパス
-- GitHub: 対象ユーザー、対象リポジトリと除外リポジトリの完全一致リスト
-- Notion: 収集を許可するデータソースID
-- WordPress: スラッグ接頭辞、カテゴリーID、タグID、投稿者ID、コメント、ピンバック、投稿フォーマット
+- [config.example/global.toml](config.example/global.toml): Global設定
+    - 基本設定: タイムゾーン、出力先
+    - 収集期間: `period.window_days` と `period.delay_days`
+    - 記事テンプレート: `article.template`
+    - Gemini: 共通モデル、3段階それぞれのモデル、各プロンプトのファイルパス
+    - WordPress: スラッグ接頭辞、カテゴリーID、タグID、投稿者ID、コメント、ピンバック、投稿フォーマット
+- [config.example/sources/github.toml](config.example/sources/github.toml): 対象ユーザー、対象リポジトリと除外リポジトリの完全一致リスト
+- [config.example/sources/notion.toml](config.example/sources/notion.toml): 収集を許可するデータソースID
 
-WordPressの `status` は常に `draft` である。設定に `status`、`slug`、`title`、`content` を加えても無視する。開示文は文面を変更できるが、空にすると組み込みの文面へ戻る。
+`config/sources/` に置いたファイルだけが収集対象になる。収集しないサービスの設定ファイルは置かない。
+
+WordPressの `status` は常に `draft` とする。設定に `status`、`slug`、`title`、`content` を指定しても無視する。
+
+記事の本文は [templates/article.md](templates/article.md) から組み立てる。AIが生成した本文を `{{ content }}` の位置へ差し込み、開示文などの固定部分はテンプレートにそのまま残す。テンプレートに `{{ content }}` がなければ、Geminiを呼ぶ前にエラーで終了する。
 
 プロンプト本文は [prompts/inspector.md](prompts/inspector.md)、[prompts/writer.md](prompts/writer.md)、[prompts/editor.md](prompts/editor.md) にある。スクリプトを変更せず、役割ごとの指示を編集できる。
 
 ## 対象期間
 
-通常実行では、実行日から `period.end_offset_days` 日前を末尾とし、そこから `period.days` 日間を収集する。既定値は実行前日までの7日間である。月曜実行なら前週の月曜から日曜までになる。
+通常実行では、実行前日から `period.delay_days` 日さかのぼった日を末尾とし、そこから `period.window_days` 日間を収集する。`period.delay_days` は、直近の予定や位置などをすぐ記事に含めないための猶予日数として設定する。
+
+- `window_days = 7`、`delay_days = 0`（既定値）: 実行前日までの7日間。月曜実行なら前週の月曜から日曜まで
+- `window_days = 7`、`delay_days = 7`: その1週間前の7日間。月曜実行なら前々週の月曜から日曜まで
 
 CLIでは次の順に設定を上書きする。
 
 1. `--from` と `--to` の組み合わせ
 1. `--target-week`
-1. TOMLの `[period]`
+1. Global設定の `[period]`
 
-`--from` と `--to` は必ず同時に指定する。
+`--from` と `--to` は必ず同時に指定する。CLIで明示した期間には `period.delay_days` を適用しない。
 
 GitHubのイベントAPIは直近300件までしか返さないため、対象期間に300件を超える活動があると期間の前半のイベントを収集できない。この場合は警告ログを出す。
 
@@ -83,7 +92,9 @@ uv run python digest.py --dump-dir tmp/2026-09-23/dump --output tmp/2026-09-23/a
 
 [.github/workflows/digest.yml](.github/workflows/digest.yml) は毎週月曜9時（日本時間）に実行し、WordPressへ下書きを保存する。手動実行では対象週と送信の有無を選べる。Repository Secretsへ次を登録する。
 
-- `DIGEST_CONFIG_TOML`: `config.toml` の内容全体
+- `CONFIG_GLOBAL`: `config/global.toml` の内容全体。登録は必須
+- `CONFIG_SOURCE_GITHUB`: `config/sources/github.toml` の内容全体。未登録時はGitHubから収集しない
+- `CONFIG_SOURCE_NOTION`: `config/sources/notion.toml` の内容全体。未登録時はNotionから収集しない
 - `GEMINI_API_KEY`
 - `GH_ACTIVITY_TOKEN`
 - `NOTION_API_KEY`
