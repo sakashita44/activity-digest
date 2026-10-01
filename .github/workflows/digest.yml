@@ -6,7 +6,7 @@ on:
     workflow_dispatch:
         inputs:
             target_week:
-                description: '対象週（例: 2026-W36、last、current。空欄はTOML設定）'
+                description: '対象週（例: 2026-W36、last、current。空欄は設定の対象期間）'
                 required: false
                 default: ''
             publish:
@@ -41,12 +41,22 @@ jobs:
             - name: 単体テスト実行
               run: uv run pytest
 
-            - name: 設定ファイルの作成
+            - name: 設定ファイルの復元
               env:
-                  DIGEST_CONFIG_TOML: ${{ secrets.DIGEST_CONFIG_TOML }}
+                  CONFIG_GLOBAL: ${{ secrets.CONFIG_GLOBAL }}
+                  CONFIG_SOURCE_GITHUB: ${{ secrets.CONFIG_SOURCE_GITHUB }}
+                  CONFIG_SOURCE_NOTION: ${{ secrets.CONFIG_SOURCE_NOTION }}
               run: |
-                  test -n "$DIGEST_CONFIG_TOML"
-                  printf '%s' "$DIGEST_CONFIG_TOML" > config.toml
+                  test -n "$CONFIG_GLOBAL"
+                  mkdir -p config/sources
+                  printf '%s' "$CONFIG_GLOBAL" > config/global.toml
+                  # 登録していないサービスは設定ファイルを置かず、収集対象から外す
+                  if [ -n "$CONFIG_SOURCE_GITHUB" ]; then
+                      printf '%s' "$CONFIG_SOURCE_GITHUB" > config/sources/github.toml
+                  fi
+                  if [ -n "$CONFIG_SOURCE_NOTION" ]; then
+                      printf '%s' "$CONFIG_SOURCE_NOTION" > config/sources/notion.toml
+                  fi
 
             - name: ダイジェスト生成パイプライン実行
               env:

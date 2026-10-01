@@ -1,0 +1,6 @@
+# ファイルを置かなければ GitHub から収集しない
+username = "octocat"
+# owner/repository の完全一致で、大文字と小文字は区別しない
+# allowlist を空にすると全リポジトリを収集する。blacklist は allowlist より優先する
+allowlist = []
+blacklist = ["octocat/secret-notes", "octocat/private-tools"]

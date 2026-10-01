@@ -1,6 +1,6 @@
 {
     "gitignore": true,
-    "ignores": ["node_modules/**", ".venv/**", ".dvc/**"],
+    "ignores": ["node_modules/**", ".venv/**", ".dvc/**", "templates/**"],
     "config": {
         "default": true,
         "MD003": { "style": "atx" },
